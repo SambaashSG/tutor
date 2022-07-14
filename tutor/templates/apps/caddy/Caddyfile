@@ -36,7 +36,7 @@
         max_size 1MB
     }
     request_body {
-        max_size 4MB
+        max_size 20MB
     }
 
     import proxy "lms:8000"
