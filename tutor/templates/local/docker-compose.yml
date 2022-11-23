@@ -32,8 +32,14 @@ services:
     privileged: false
     volumes:
       - ../../data/mysql:/var/lib/mysql
+      {% if MYSQL_IP_BIND %}
+      - './mysql/my.cnf:/etc/mysql/my.cnf'
+      {% endif %}
     environment:
       MYSQL_ROOT_PASSWORD: "{{ MYSQL_ROOT_PASSWORD }}"
+      {% if MYSQL_IP_BIND %}
+      MYSQL_ROOT_HOST: "0.0.0.0"
+      {% endif %}
   mysql-permissions:
     image: {{ DOCKER_IMAGE_PERMISSIONS }}
     command: ["999", "/var/lib/mysql"]
@@ -188,7 +194,8 @@ services:
     environment:
       SERVICE_VARIANT: cms
       DJANGO_SETTINGS_MODULE: cms.envs.tutor.production
-    command: celery worker --app=cms.celery --loglevel=info --hostname=edx.cms.core.default.%%h --maxtasksperchild 100 --exclude-queues=edx.lms.core.default
+    #command: celery worker --app=cms.celery --loglevel=info --hostname=edx.cms.core.default.%%h --maxtasksperchild 100 --exclude-queues=edx.lms.core.default
+    command: bash -c "celery worker --app=cms.celery --loglevel=info --hostname=edx.cms.core.default.%%h --maxtasksperchild 100 --exclude-queues=edx.lms.core.default && celery --app=cms.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler"
     restart: unless-stopped
     volumes:
       - ../apps/openedx/settings/lms:/openedx/edx-platform/lms/envs/tutor:ro
