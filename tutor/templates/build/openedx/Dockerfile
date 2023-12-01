@@ -90,6 +90,9 @@ WORKDIR /openedx/edx-platform
 # https://pypi.org/project/wheel/
 RUN pip install setuptools==62.1.0 pip==22.0.4 wheel==0.37.1
 
+# Install missing py2neo package that was abruptly trimmed from pypi
+RUN pip install https://github.com/overhangio/py2neo/releases/download/2021.2.3/py2neo-2021.2.3.tar.gz
+
 # Install base requirements
 RUN pip install -r ./requirements/edx/base.txt
 
