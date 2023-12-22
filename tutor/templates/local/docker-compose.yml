@@ -31,7 +31,7 @@ services:
     user: "999:999"
     {% if MYSQL_IP_BIND %}
     ports:
-      - "3306:3306"
+      - "3306:3906"
     {% endif %}
     privileged: false
     volumes:
