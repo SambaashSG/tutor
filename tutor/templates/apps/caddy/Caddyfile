@@ -60,7 +60,7 @@
 
     handle_path /* {
         request_body {
-            max_size 4MB
+            max_size 50MB
         }
     }
 }

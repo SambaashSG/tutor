@@ -48,10 +48,13 @@ services:
       --mysql-native-password=ON
     restart: unless-stopped
     user: "999:999"
+    ports:
+      - "3306:3306"
     volumes:
       - ../../data/mysql:/var/lib/mysql
     environment:
       MYSQL_ROOT_PASSWORD: "{{ MYSQL_ROOT_PASSWORD }}"
+      MYSQL_ROOT_HOST: "0.0.0.0"
   {%- endif %}
 
   {% if RUN_MEILISEARCH -%}
