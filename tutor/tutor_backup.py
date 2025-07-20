@@ -4,58 +4,57 @@ import shutil
 import sys
 import json
 import time
+import multiprocessing
+import tarfile
+import hashlib
 from datetime import datetime
+from dotenv import load_dotenv
 
-# ========= CONFIGURATION =========
+# ========= LOAD ENVIRONMENT =========
 
-CLIENT_NAME = "buma"
-ENV_TYPE = "prod"  # Options: prod, uat, demo, stg, test, dev.
+load_dotenv()
 
-REMOTE_SERVER = "sambaash@172.188.10.221"
-REMOTE_PATH = "/home/sambaash/.local/share/tutor/backup"
+CLIENT_NAME = os.getenv("CLIENT_NAME", "buma")
+ENV_TYPE = os.getenv("ENV_TYPE", "prod")
 
-# Embedded SSH Private Key
-SSH_PRIVATE_KEY = """
-"""
+REMOTE_SERVER = os.getenv("REMOTE_SERVER")
+REMOTE_PATH = os.getenv("REMOTE_PATH")
 
-SSH_PUBLIC_KEY = """
-"""
+SSH_PRIVATE_KEY = os.getenv("SSH_PRIVATE_KEY")
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/home/ubuntu/.ssh/backup_id_rsa")
 
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
+AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
+AWS_S3_PREFIX = os.getenv("AWS_S3_PREFIX", "tutor-backup")
 
-SSH_KEY_PATH = "/home/ubuntu/.ssh/backup_id_rsa"
-
-# AWS S3 Config
-AWS_ACCESS_KEY_ID = ""
-AWS_SECRET_ACCESS_KEY = ""
-AWS_REGION = "ap-southeast-1"
-AWS_BUCKET_NAME = "sambaash-backup"
-AWS_S3_PREFIX = "tutor-backup"
-
-# GCP Service Account JSON (embed full JSON)
-GCP_SERVICE_ACCOUNT_JSON = """
-"""
+GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
 BACKUP_DIR = "/tmp/tutor-backup"
-CRON_SCHEDULE = "0 2 * * *"
 
 # ========= UTILS =========
+
 
 def log_time(message, start_time):
     elapsed = time.perf_counter() - start_time
     print(f"[{message}] completed in {elapsed:.2f} seconds.")
 
+
 def run(cmd, check=True):
     print(f"Running: {cmd}")
     subprocess.run(cmd, shell=True, check=check)
 
+
 def install_python_package(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=True)
+
 
 def is_installed(command):
     return shutil.which(command) is not None
 
-def install_system_packages():
-    start = time.perf_counter()
+
+def install_requirements():
     pkgs = []
     if not is_installed("aws"):
         pkgs.append("awscli")
@@ -63,40 +62,39 @@ def install_system_packages():
         pkgs.append("rsync")
     if pkgs:
         run(f"sudo apt-get update && sudo apt-get install -y {' '.join(pkgs)}")
-    log_time("System package installation", start)
 
-def install_python_packages():
-    start = time.perf_counter()
     try:
         import boto3
     except ImportError:
         install_python_package("boto3")
+
     try:
         from google.cloud import storage
     except ImportError:
         install_python_package("google-cloud-storage")
-    log_time("Python package installation", start)
+
+
+# ========= BACKUP FUNCTIONS =========
+
+
+def ensure_ssh_key():
+    if os.path.exists(SSH_KEY_PATH):
+        return
+    os.makedirs(os.path.dirname(SSH_KEY_PATH), exist_ok=True)
+    with open(SSH_KEY_PATH, "w") as f:
+        f.write(SSH_PRIVATE_KEY.replace("\n", "").strip() + "")
+    os.chmod(SSH_KEY_PATH, 0o600)
+
 
 def get_tutor_value(key):
     return subprocess.check_output(f"tutor config printvalue {key}", shell=True).decode().strip()
 
+
 def get_tutor_root():
     return subprocess.check_output("tutor config printroot", shell=True).decode().strip()
 
-def ensure_ssh_key():
-    if os.path.exists(SSH_KEY_PATH):
-        print(f"SSH key already exists at {SSH_KEY_PATH}. Skipping write.")
-        return
-    os.makedirs(os.path.dirname(SSH_KEY_PATH), exist_ok=True)
-    print(f"Writing SSH key to {SSH_KEY_PATH}")
-    with open(SSH_KEY_PATH, "w") as f:
-        f.write(SSH_PRIVATE_KEY.strip() + "\n")
-    os.chmod(SSH_KEY_PATH, 0o600)
-
-# ========= BACKUP FUNCTIONS =========
 
 def mysql_dump(dump_path):
-    start = time.perf_counter()
     username = get_tutor_value("MYSQL_ROOT_USERNAME")
     password = get_tutor_value("MYSQL_ROOT_PASSWORD")
     cmd = (
@@ -105,135 +103,144 @@ def mysql_dump(dump_path):
     )
     run(cmd)
     src = os.path.join(get_tutor_root(), "data/mysql/dump.sql")
-    shutil.copy(src, os.path.join(dump_path, "mysql_dump.sql"))
-    log_time("MySQL dump", start)
+    dest = os.path.join(dump_path, "mysql_dump.sql")
+    shutil.copy(src, dest)
+    os.remove(src)
 
-def mongodb_dump(dump_path):
-    start = time.perf_counter()
+
+def mongodb_dump():
     cmd = "tutor local exec mongodb mongodump --out=/data/db/dump.mongodb"
     run(cmd)
-    src = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
-    shutil.make_archive(os.path.join(dump_path, "mongodb_dump"), 'zip', src)
-    log_time("MongoDB dump", start)
+    dump_path = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
+    return dump_path
 
-def media_backup(dump_path):
-    start = time.perf_counter()
-    src = os.path.join(get_tutor_root(), "data/openedx-media")
-    shutil.make_archive(os.path.join(dump_path, "openedx-media"), 'zip', src)
-    log_time("Media backup", start)
 
-# ========= TRANSFER FUNCTIONS =========
+# ========= COMPRESSION =========
 
-def rsync_transfer(archive_path):
-    start = time.perf_counter()
-    try:
-        cmd = f'rsync -avz -e "ssh -i {SSH_KEY_PATH}" --progress {archive_path} {REMOTE_SERVER}:{REMOTE_PATH}/'
-        run(cmd)
-    except Exception as e:
-        print(f"WARNING: rsync transfer failed: {e}")
-    log_time("Rsync transfer", start)
 
-def s3_transfer(archive_path):
-    start = time.perf_counter()
-    try:
-        import boto3
-        session = boto3.session.Session(
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_REGION
-        )
-        s3 = session.client('s3')
-        filename = os.path.basename(archive_path)
-        s3_key = os.path.join(AWS_S3_PREFIX, datetime.now().strftime('%Y%m%d'), filename)
-        print(f"Uploading {filename} to S3 bucket {AWS_BUCKET_NAME}/{s3_key}")
-        s3.upload_file(archive_path, AWS_BUCKET_NAME, s3_key)
-    except Exception as e:
-        print(f"WARNING: S3 upload failed: {e}")
-    log_time("S3 transfer", start)
+def compress_tar(directory, output_file):
+    with tarfile.open(output_file, "w:gz") as tar:
+        tar.add(directory, arcname=os.path.basename(directory))
 
-def gcs_transfer(archive_path):
-    start = time.perf_counter()
-    try:
-        from google.cloud import storage
-        key_path = "/tmp/gcp_service_account.json"
-        with open(key_path, "w") as f:
-            json.dump(json.loads(GCP_SERVICE_ACCOUNT_JSON), f)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(AWS_BUCKET_NAME)
-        filename = os.path.basename(archive_path)
-        blob_name = f"{AWS_S3_PREFIX}/{datetime.now().strftime('%Y%m%d')}/{filename}"
-        blob = bucket.blob(blob_name)
-        print(f"Uploading {filename} to GCS bucket {AWS_BUCKET_NAME}/{blob_name}")
-        blob.upload_from_filename(archive_path)
-        os.remove(key_path)
-    except Exception as e:
-        print(f"WARNING: GCS upload failed: {e}")
-    log_time("GCS transfer", start)
+def generate_checksum(file_path):
+    checksum_file = file_path + ".sha256"
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    with open(checksum_file, "w") as f:
+        f.write(f"{sha256_hash.hexdigest()}  {os.path.basename(file_path)}\n")
+    return checksum_file
 
-# ========= CRON SETUP =========
 
-def setup_cron(script_path):
-    cron_entry = f"{CRON_SCHEDULE} nohup python3 {script_path} >> /home/ubuntu/sync.log 2>&1"
-    try:
-        existing_cron = subprocess.check_output("crontab -l", shell=True, text=True)
-    except subprocess.CalledProcessError:
-        existing_cron = ""
+# ========= TRANSFER & CLEANUP =========
 
-    if cron_entry in existing_cron:
-        print("[tutor-backup] Cron job already exists.")
-    else:
-        new_cron = existing_cron.strip() + "\n" + cron_entry + "\n"
-        subprocess.run(f'echo "{new_cron}" | crontab -', shell=True, check=True)
-        print("[tutor-backup] Cron job installed.")
+
+def transfer_files(files_to_transfer, remote_folder, targets):
+    # Clean up MongoDB dump directory after compression
+    mongodb_dump_dir = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
+    if os.path.exists(mongodb_dump_dir):
+        try:
+            run(f'sudo rm -rf {mongodb_dump_dir}')
+        except Exception as e:
+            print(f"WARNING: Failed to remove MongoDB dump directory with sudo: {e}")
+    for file in files_to_transfer:
+        generate_checksum(file)
+
+    if "rsync" in targets:
+        try:
+            # Ensure remote directory exists
+            run(f'ssh -i {SSH_KEY_PATH} {REMOTE_SERVER} "mkdir -p {REMOTE_PATH}/{remote_folder}"')
+            file_list = " ".join([file + " " + file + ".sha256" for file in files_to_transfer])
+            run(f'rsync -avz -e "ssh -i {SSH_KEY_PATH}" --progress {file_list} {REMOTE_SERVER}:{REMOTE_PATH}/{remote_folder}/')
+        except Exception as e:
+            print(f"WARNING: rsync failed: {e}")
+
+    if "s3" in targets:
+        try:
+            import boto3
+            session = boto3.session.Session(
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                region_name=AWS_REGION
+            )
+            s3 = session.client('s3')
+            for file in files_to_transfer:
+                for upload_file in [file, file + ".sha256"]:
+                    filename = os.path.basename(upload_file)
+                    s3_key = os.path.join(AWS_S3_PREFIX, remote_folder, filename)
+                    s3.upload_file(upload_file, AWS_BUCKET_NAME, s3_key)
+        except Exception as e:
+            print(f"WARNING: S3 upload failed: {e}")
+
+    if "gcs" in targets:
+        try:
+            from google.cloud import storage
+            key_path = "/tmp/gcp_service_account.json"
+            with open(key_path, "w") as f:
+                json.dump(json.loads(GCP_SERVICE_ACCOUNT_JSON), f)
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+
+            storage_client = storage.Client()
+            bucket = storage_client.bucket(AWS_BUCKET_NAME)
+            for file in files_to_transfer:
+                for upload_file in [file, file + ".sha256"]:
+                    filename = os.path.basename(upload_file)
+                    blob_name = f"{AWS_S3_PREFIX}/{remote_folder}/{filename}"
+                    blob = bucket.blob(blob_name)
+                    blob.upload_from_filename(upload_file)
+            os.remove(key_path)
+        except Exception as e:
+            print(f"WARNING: GCS upload failed: {e}")
+
+    for file in files_to_transfer:
+        os.remove(file)
+        os.remove(file + ".sha256")
+    print("Cleanup complete.")
+
 
 # ========= MAIN =========
 
-def main():
-    total_start = time.perf_counter()
 
+def main():
     ensure_ssh_key()
-    install_system_packages()
-    install_python_packages()
+    install_requirements()
+
+    targets = ["rsync", "s3", "gcs"]
 
     today_str = datetime.now().strftime("%Y%m%d")
-    archive_name = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{today_str}.tar.gz"
-    archive_path = os.path.join(BACKUP_DIR, archive_name)
+    folder_name = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{today_str}"
+    backup_path = os.path.join(BACKUP_DIR, folder_name)
 
-    if os.path.exists(archive_path):
-        print(f"Backup for today already exists: {archive_path}. Skipping backup creation.")
-    else:
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        dump_path = os.path.join(BACKUP_DIR, timestamp)
-        os.makedirs(dump_path, exist_ok=True)
+    if os.path.exists(backup_path):
+        print(f"Backup already exists for today: {backup_path}")
+        return
 
-        try:
-            mysql_dump(dump_path)
-            mongodb_dump(dump_path)
-            media_backup(dump_path)
+    os.makedirs(backup_path, exist_ok=True)
 
-            start = time.perf_counter()
-            print(f"Creating compressed archive: {archive_path}")
-            shutil.make_archive(archive_path.replace('.tar.gz', ''), 'gztar', dump_path)
-            log_time("Compression", start)
+    mysql_dump_file = os.path.join(backup_path, "mysql_dump.tar.gz")
+    mongodb_dump_dir = mongodb_dump()
+    mongodb_tar_file = os.path.join(backup_path, "mongodb_dump.tar.gz")
+    openedx_media_dir = os.path.join(get_tutor_root(), "data/openedx-media")
+    openedx_tar_file = os.path.join(backup_path, "openedx_media.tar.gz")
 
-        except Exception as e:
-            print(f"ERROR during backup creation: {e}")
-        finally:
-            shutil.rmtree(dump_path)
+    tasks = [
+        (os.path.join(backup_path, "mysql_dump.sql"), mysql_dump_file),
+        (mongodb_dump_dir, mongodb_tar_file),
+        (openedx_media_dir, openedx_tar_file)
+    ]
 
-    print("Starting transfers...")
+    pool = multiprocessing.Pool()
+    for src, output in tasks:
+        pool.apply_async(compress_tar, (src, output))
+    pool.close()
+    pool.join()
 
-    rsync_transfer(archive_path)
-    s3_transfer(archive_path)
-    gcs_transfer(archive_path)
+    files_to_transfer = [mysql_dump_file, mongodb_tar_file, openedx_tar_file]
 
-    print("All transfer attempts complete.")
+    transfer_files(files_to_transfer, folder_name, targets)
 
-    setup_cron(os.path.abspath(__file__))
-
-    log_time("Total backup process", total_start)
 
 if __name__ == "__main__":
     main()
