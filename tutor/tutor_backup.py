@@ -393,7 +393,13 @@ def transfer_files(files_to_transfer, remote_folder, targets):
     for file in files_to_transfer:
         os.remove(file)
         os.remove(file + ".sha256")
+
+    # Get the directory containing the backup files
+    backup_dir = os.path.dirname(files_to_transfer[0]) if files_to_transfer else None
+
     print("Cleanup complete.")
+
+    return backup_dir  # Return the backup directory path for cleanup in main
 
 
 # ========= MAIN =========
@@ -455,6 +461,19 @@ def main():
 
     # Transfer compressed files
     transfer_files(files_to_transfer, folder_name, targets)
+
+    # Remove the backup folder after successful transfer
+    if os.path.exists(backup_path):
+        try:
+            shutil.rmtree(backup_path)
+            print(f"Removed temporary backup folder: {backup_path}")
+        except Exception as e:
+            print(f"Warning: Could not remove backup folder {backup_path}: {e}")
+            try:
+                run(f"sudo rm -rf {backup_path}")
+                print(f"Removed temporary backup folder with sudo: {backup_path}")
+            except Exception as e2:
+                print(f"Error: Failed to remove backup folder even with sudo: {e2}")
 
     log_time("Total backup process", total_start_time)
 
