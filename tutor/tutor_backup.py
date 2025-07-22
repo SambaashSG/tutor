@@ -39,6 +39,12 @@ BACKUP_DIR = "/tmp/tutor-backup"
 # Number of workers for parallel operations
 NUM_WORKERS = multiprocessing.cpu_count()
 
+# Compression settings (1-9, where 1 is fastest but largest, 9 is slowest but smallest)
+# For backups, a moderate level like 3-5 is often a good balance
+COMPRESSION_LEVEL = os.getenv("COMPRESSION_LEVEL", "3")
+# Set to True to use faster external compression tools if available (pigz, pbzip2)
+USE_FAST_COMPRESSION = os.getenv("USE_FAST_COMPRESSION", "true").lower() in ("true", "yes", "1")
+
 # ========= UTILS =========
 
 
@@ -66,6 +72,11 @@ def install_requirements():
         pkgs.append("awscli")
     if not is_installed("rsync"):
         pkgs.append("rsync")
+    if USE_FAST_COMPRESSION:
+        if not is_installed("pigz"):
+            pkgs.append("pigz")
+        if not is_installed("pbzip2"):
+            pkgs.append("pbzip2")
     if pkgs:
         run(f"sudo apt-get update && sudo apt-get install -y {' '.join(pkgs)}")
 
@@ -100,46 +111,30 @@ def get_tutor_root():
     return subprocess.check_output("tutor config printroot", shell=True).decode().strip()
 
 
-def mysql_dump(dump_path):
-    """Execute MySQL dump using sudo to avoid permission issues"""
+def mysql_dump():
+    """Execute MySQL dump directly to the dump directory"""
     start_time = time.perf_counter()
     username = get_tutor_value("MYSQL_ROOT_USERNAME")
     password = get_tutor_value("MYSQL_ROOT_PASSWORD")
+
+    # Create a directory for MySQL dump similar to MongoDB
     tutor_root = get_tutor_root()
 
-    # Use a unique temp file name to avoid conflicts
-    timestamp = int(time.time())
-    temp_dump_file = f"/tmp/mysql_dump_{timestamp}.sql"
+    # Determine the path inside the container that maps to our mysql_dump_dir
+    # This is typically /var/lib/mysql/dump.mysql
+    container_dump_path = "/var/lib/mysql"
 
+    # Generate the MySQL dump directly to the directory
     cmd = (
         f'tutor local exec -e USERNAME="{username}" -e PASSWORD="{password}" '
-        f'mysql sh -c \'mysqldump --all-databases --user=$USERNAME --password=$PASSWORD > /var/lib/mysql/dump.sql\''
+        f'mysql sh -c \'mysqldump --all-databases --user=$USERNAME --password=$PASSWORD > {container_dump_path}/all-databases.sql\''
     )
     run(cmd)
 
-    src = os.path.join(tutor_root, "data/mysql/dump.sql")
-    dest = os.path.join(dump_path, "mysql_dump.sql")
-
-    # First copy to a temporary location with sudo to handle permissions
-    try:
-        run(f"sudo cp {src} {temp_dump_file}")
-        run(f"sudo chown $USER:$USER {temp_dump_file}")
-        # Now we can safely copy from temp to final destination
-        shutil.copy(temp_dump_file, dest)
-        # Clean up temp file
-        os.remove(temp_dump_file)
-    except Exception as e:
-        print(f"Warning: Error handling MySQL dump file: {e}")
-        # Try direct copy as fallback
-        try:
-            run(f"sudo cp {src} {dest}")
-            run(f"sudo chown $USER:$USER {dest}")
-        except Exception as e2:
-            print(f"Fatal error: Could not copy MySQL dump: {e2}")
-            raise
+    dump_file = os.path.join(get_tutor_root(), "data/mysql/all-databases.sql")
 
     log_time("MySQL dump", start_time)
-    return dest
+    return dump_file
 
 
 def mongodb_dump():
@@ -153,13 +148,91 @@ def mongodb_dump():
 
 # ========= COMPRESSION =========
 
+def is_small_file(file_path):
+    """Check if file is small enough to use simple compression"""
+    try:
+        if os.path.isfile(file_path):
+            # For files under 100MB, use simple compression
+            return os.path.getsize(file_path) < 100 * 1024 * 1024
+        elif os.path.isdir(file_path):
+            # Check total size of directory
+            total_size = 0
+            for dirpath, _, filenames in os.walk(file_path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.isfile(fp):
+                        total_size += os.path.getsize(fp)
+                    if total_size >= 100 * 1024 * 1024:
+                        return False
+            return True
+        return True
+    except Exception:
+        # If we can't determine size, assume it's large
+        return False
+
+
+def compress_tar_py(directory, output_file):
+    """Use Python's tarfile module for small files or when external tools aren't available"""
+    with tarfile.open(output_file, f"w:gz", compresslevel=int(COMPRESSION_LEVEL)) as tar:
+        tar.add(directory, arcname=os.path.basename(directory))
+    return output_file
+
+
+def compress_tar_fast(directory, output_file):
+    """Use faster external compression tools (pigz or pbzip2) for tar creation"""
+    if is_installed("pigz"):
+        # pigz is a parallel implementation of gzip
+        cores = max(1, multiprocessing.cpu_count() - 1)
+        cmd = f"tar -cf - -C {os.path.dirname(directory)} {os.path.basename(directory)} | pigz -p {cores} -{COMPRESSION_LEVEL} > {output_file}"
+        run(cmd)
+    elif is_installed("pbzip2"):
+        # pbzip2 is a parallel implementation of bzip2 - slower than pigz but better compression
+        cores = max(1, multiprocessing.cpu_count() - 1)
+        cmd = f"tar -cf - -C {os.path.dirname(directory)} {os.path.basename(directory)} | pbzip2 -p{cores} -{COMPRESSION_LEVEL} > {output_file.replace('.tar.gz', '.tar.bz2')}"
+        run(cmd)
+        # Rename if needed
+        if output_file.endswith('.tar.gz') and os.path.exists(output_file.replace('.tar.gz', '.tar.bz2')):
+            os.rename(output_file.replace('.tar.gz', '.tar.bz2'), output_file)
+    else:
+        # Fallback to standard tar with gzip
+        cmd = f"tar -czf {output_file} -C {os.path.dirname(directory)} {os.path.basename(directory)}"
+        run(cmd)
+    return output_file
+
 
 def compress_tar(args):
     directory, output_file = args
     start_time = time.perf_counter()
     print(f"Compressing {directory} to {output_file}")
-    with tarfile.open(output_file, "w:gz") as tar:
-        tar.add(directory, arcname=os.path.basename(directory))
+
+    # Check if directory exists
+    if not os.path.exists(directory):
+        print(f"Warning: Directory {directory} does not exist. Skipping compression.")
+        return None
+
+    # Handle permission issues
+    try:
+        # First try with fast external tools if enabled
+        if USE_FAST_COMPRESSION and not is_small_file(directory):
+            try:
+                compress_tar_fast(directory, output_file)
+            except Exception as e:
+                print(f"Warning: Fast compression failed, falling back to Python implementation: {e}")
+                compress_tar_py(directory, output_file)
+        else:
+            # For small files, use Python's implementation
+            compress_tar_py(directory, output_file)
+    except Exception as e:
+        print(f"Warning: Error compressing {directory}: {e}")
+        # Try with sudo
+        try:
+            cmd = f"sudo tar -czf {output_file} -C {os.path.dirname(directory)} {os.path.basename(directory)}"
+            run(cmd)
+            run(f"sudo chown $USER:$USER {output_file}")
+        except Exception as e2:
+            print(f"Fatal error compressing {directory}: {e2}")
+            raise
+
     log_time(f"Compression of {os.path.basename(output_file)}", start_time)
     return output_file
 
@@ -263,13 +336,23 @@ def gcs_transfer(files_list, remote_folder):
 
 
 def transfer_files(files_to_transfer, remote_folder, targets):
-    # Clean up MongoDB dump directory after compression
-    mongodb_dump_dir = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
-    if os.path.exists(mongodb_dump_dir):
-        try:
-            run(f'sudo rm -rf {mongodb_dump_dir}')
-        except Exception as e:
-            print(f"WARNING: Failed to remove MongoDB dump directory with sudo: {e}")
+    # Clean up dump directories after compression
+    tutor_root = get_tutor_root()
+    mongodb_dump_dir = os.path.join(tutor_root, "data/mongodb/dump.mongodb")
+    mysql_dump_dir = os.path.join(tutor_root, "data/mysql/all-databases.sql")
+
+    for dump_dir in [mongodb_dump_dir, mysql_dump_dir]:
+        if os.path.exists(dump_dir):
+            try:
+                run(f'sudo rm -rf {dump_dir}')
+            except Exception as e:
+                print(f"WARNING: Failed to remove dump directory {dump_dir}: {e}")
+
+    # Filter out None values from files_to_transfer
+    files_to_transfer = [f for f in files_to_transfer if f is not None]
+    if not files_to_transfer:
+        print("WARNING: No files to transfer!")
+        return
 
     # Generate checksums in parallel
     start_time = time.perf_counter()
@@ -332,16 +415,18 @@ def main():
         print(f"Backup already exists for today: {backup_path}")
         return
 
-    os.makedirs(backup_path, exist_ok=True)
+    try:
+        os.makedirs(backup_path, exist_ok=True)
+    except Exception:
+        run(f"sudo mkdir -p {backup_path}")
+        run(f"sudo chown $USER:$USER {backup_path}")
 
-    # Run database dumps in parallel
-    with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
-        mysql_future = executor.submit(mysql_dump, backup_path)
-        mongodb_future = executor.submit(mongodb_dump)
+    # Run database dumps sequentially to avoid Docker container issues
+    print("Starting MySQL dump...")
+    mysql_dump_dir = mysql_dump()
 
-        # Wait for database dumps to complete
-        mysql_dump_sql = mysql_future.result()
-        mongodb_dump_dir = mongodb_future.result()
+    print("Starting MongoDB dump...")
+    mongodb_dump_dir = mongodb_dump()
 
     # Set up compression tasks
     mysql_dump_file = os.path.join(backup_path, "mysql_dump.tar.gz")
@@ -350,16 +435,23 @@ def main():
     openedx_tar_file = os.path.join(backup_path, "openedx_media.tar.gz")
 
     compression_tasks = [
-        (mysql_dump_sql, mysql_dump_file),
+        (mysql_dump_dir, mysql_dump_file),
         (mongodb_dump_dir, mongodb_tar_file),
         (openedx_media_dir, openedx_tar_file)
     ]
 
-    # Run compression in parallel
+    # Run compression in parallel with ThreadPoolExecutor
     files_to_transfer = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        for result in executor.map(compress_tar, compression_tasks):
-            files_to_transfer.append(result)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        future_to_task = {executor.submit(compress_tar, task): task for task in compression_tasks}
+        for future in concurrent.futures.as_completed(future_to_task):
+            try:
+                result = future.result()
+                if result:
+                    files_to_transfer.append(result)
+            except Exception as e:
+                task = future_to_task[future]
+                print(f"Compression task failed for {task[0]}: {e}")
 
     # Transfer compressed files
     transfer_files(files_to_transfer, folder_name, targets)
