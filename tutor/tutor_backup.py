@@ -15,7 +15,13 @@ from functools import partial
 
 # ========= LOAD ENVIRONMENT =========
 
-load_dotenv()
+dotenv_path = os.environ.get("DOTENV_PATH")
+if dotenv_path and os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    # Fall back to default behavior
+    load_dotenv()
+
 
 CLIENT_NAME = os.getenv("CLIENT_NAME", "buma")
 ENV_TYPE = os.getenv("ENV_TYPE", "prod")
@@ -53,9 +59,30 @@ def log_time(message, start_time):
     print(f"[{message}] completed in {elapsed:.2f} seconds.")
 
 
+
 def run(cmd, check=True):
+    """Run a shell command with better error handling"""
     print(f"Running: {cmd}")
-    subprocess.run(cmd, shell=True, check=check)
+    try:
+        process = subprocess.run(
+            cmd,
+            shell=True,
+            check=check,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True  # Get string output instead of bytes
+        )
+        if process.stdout:
+            print(f"STDOUT: {process.stdout}")
+        return process
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Command failed with status {e.returncode}")
+        if e.stdout:
+            print(f"STDOUT: {e.stdout}")
+        if e.stderr:
+            print(f"STDERR: {e.stderr}")
+        if check:
+            raise
 
 
 def install_python_package(pkg):
@@ -124,14 +151,39 @@ def mysql_dump():
     # This is typically /var/lib/mysql/dump.mysql
     container_dump_path = "/var/lib/mysql"
 
+    compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
+    project_name = "tutor_local"
+
     # Generate the MySQL dump directly to the directory
-    cmd = (
-        f'tutor local exec -e USERNAME="{username}" -e PASSWORD="{password}" '
-        f'mysql sh -c \'mysqldump --all-databases --user=$USERNAME --password=$PASSWORD > {container_dump_path}/all-databases.sql\''
-    )
-    run(cmd)
+    # Use single quotes for the outer shell and double quotes for the inner variables
+    # to avoid nesting issues
+    cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T -e USERNAME={username} -e PASSWORD={password} mysql sh -c \"mysqldump --all-databases --user=\\$USERNAME --password=\\$PASSWORD > {container_dump_path}/all-databases.sql\""
+
+    # Add retry logic for more reliability
+    max_attempts = 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"MySQL dump attempt {attempt}/{max_attempts}")
+            run(cmd)
+            break  # If successful, break out of the retry loop
+        except Exception as e:
+            print(f"MySQL dump attempt {attempt} failed: {e}")
+            if attempt == max_attempts:
+                print("All MySQL dump attempts failed")
+                raise  # Re-raise the last exception after all attempts fail
+            else:
+                print(f"Waiting 30 seconds before retry...")
+                time.sleep(30)  # Wait before retry
 
     dump_file = os.path.join(get_tutor_root(), "data/mysql/all-databases.sql")
+
+    # Verify that the dump was created
+    if not os.path.exists(dump_file):
+        raise FileNotFoundError(f"MySQL dump file was not created at {dump_file}")
+
+    # Check if the file size is reasonable (at least 1KB)
+    if os.path.getsize(dump_file) < 1024:
+        raise ValueError(f"MySQL dump file is too small ({os.path.getsize(dump_file)} bytes). Dump may have failed.")
 
     log_time("MySQL dump", start_time)
     return dump_file
@@ -139,9 +191,38 @@ def mysql_dump():
 
 def mongodb_dump():
     start_time = time.perf_counter()
-    cmd = "tutor local exec mongodb mongodump --out=/data/db/dump.mongodb"
-    run(cmd)
+
+    tutor_root = get_tutor_root()
+    compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
+    project_name = "tutor_local"
+
+    # Add retry logic for more reliability
+    max_attempts = 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            print(f"MongoDB dump attempt {attempt}/{max_attempts}")
+            cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T mongodb mongodump --out=/data/db/dump.mongodb"
+            run(cmd)
+            break  # If successful, break out of the retry loop
+        except Exception as e:
+            print(f"MongoDB dump attempt {attempt} failed: {e}")
+            if attempt == max_attempts:
+                print("All MongoDB dump attempts failed")
+                raise  # Re-raise the last exception after all attempts fail
+            else:
+                print(f"Waiting 30 seconds before retry...")
+                time.sleep(30)  # Wait before retry
+
     dump_path = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
+
+    # Verify that the dump directory was created
+    if not os.path.exists(dump_path):
+        raise FileNotFoundError(f"MongoDB dump directory was not created at {dump_path}")
+
+    # Check if the directory has content
+    if not os.listdir(dump_path):
+        raise ValueError(f"MongoDB dump directory is empty. Dump may have failed.")
+
     log_time("MongoDB dump", start_time)
     return dump_path
 
