@@ -4,7 +4,7 @@
 # Usage: ./tutor_backup_wrapper.sh [backup|restore] [additional args]
 
 # Define paths
-SCRIPT_DIR="/home/ubuntu/.local/share/tutor"
+SCRIPT_DIR="/home/sambaash/.local/share/tutor"
 ENV_FILE="$SCRIPT_DIR/.env"
 LOG_FILE="$SCRIPT_DIR/tutor_backup.log"
 BACKUP_SCRIPT="$SCRIPT_DIR/tutor_backup_full.py"
@@ -20,7 +20,7 @@ log "-------------------------------------------"
 log "Starting backup wrapper script"
 
 # Set home directory explicitly (important for cron)
-export HOME="/home/ubuntu"
+export HOME="/home/sambaash"
 log "HOME set to $HOME"
 
 # Source environment variables
@@ -80,20 +80,23 @@ log "Python binary: $PYTHON_BIN"
 
 if [ -n "$PYTHON_BIN" ]; then
     # Check if required packages are installed in the current environment
-    missing_packages=""
+    missing_packages=()
     if ! $PYTHON_BIN -c "import boto3" 2>/dev/null; then
-        missing_packages="$missing_packages boto3"
+        missing_packages+=("boto3")
     fi
     if ! $PYTHON_BIN -c "import google.cloud.storage" 2>/dev/null; then
-        missing_packages="$missing_packages google-cloud-storage"
+        missing_packages+=("google-cloud-storage")
     fi
     if ! $PYTHON_BIN -c "import dotenv" 2>/dev/null; then
-        missing_packages="$missing_packages python-dotenv"
+        missing_packages+=("python-dotenv")
     fi
 
-    if [ -n "$missing_packages" ]; then
-        log "Installing missing Python packages in ol_env:$missing_packages"
-        $PYTHON_BIN -m pip install "$missing_packages"
+    if [ ${#missing_packages[@]} -gt 0 ]; then
+        log "Installing missing Python packages in ol_env: ${missing_packages[*]}"
+        for package in "${missing_packages[@]}"; do
+            log "Installing package: $package"
+            $PYTHON_BIN -m pip install "$package"
+        done
         log "Python packages installed"
     else
         log "All required Python packages are already installed in ol_env"
