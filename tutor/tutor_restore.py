@@ -27,7 +27,7 @@ REMOTE_SERVER = os.getenv("REMOTE_SERVER")
 REMOTE_PATH = os.getenv("REMOTE_PATH")
 
 SSH_PRIVATE_KEY = os.getenv("SSH_PRIVATE_KEY")
-SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/home/ubuntu/.ssh/backup_id_rsa")
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", "/home/sambaash/.ssh/backup_id_rsa")
 
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
