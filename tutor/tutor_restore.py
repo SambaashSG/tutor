@@ -13,7 +13,12 @@ from dotenv import load_dotenv
 
 # ========= LOAD ENVIRONMENT =========
 
-load_dotenv()
+dotenv_path = os.environ.get("DOTENV_PATH")
+if dotenv_path and os.path.exists(dotenv_path):
+    load_dotenv(dotenv_path)
+else:
+    # Fall back to default behavior
+    load_dotenv()
 
 CLIENT_NAME = os.getenv("CLIENT_NAME", "buma")
 ENV_TYPE = os.getenv("ENV_TYPE", "prod")
@@ -34,21 +39,46 @@ GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
 RESTORE_DIR = "/tmp/tutor-restore"
 
+
 # ========= UTILS =========
 
 def log_time(message, start_time):
     elapsed = time.perf_counter() - start_time
     print(f"[{message}] completed in {elapsed:.2f} seconds.")
 
+
 def run(cmd, check=True):
+    """Run a shell command with better error handling"""
     print(f"Running: {cmd}")
-    subprocess.run(cmd, shell=True, check=check)
+    try:
+        process = subprocess.run(
+            cmd,
+            shell=True,
+            check=check,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True  # Get string output instead of bytes
+        )
+        if process.stdout:
+            print(f"STDOUT: {process.stdout}")
+        return process
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Command failed with status {e.returncode}")
+        if e.stdout:
+            print(f"STDOUT: {e.stdout}")
+        if e.stderr:
+            print(f"STDERR: {e.stderr}")
+        if check:
+            raise
+
 
 def install_python_package(pkg):
     subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=True)
 
+
 def is_installed(command):
     return shutil.which(command) is not None
+
 
 def install_requirements():
     pkgs = []
@@ -69,6 +99,7 @@ def install_requirements():
     except ImportError:
         install_python_package("google-cloud-storage")
 
+
 def ensure_ssh_key():
     if os.path.exists(SSH_KEY_PATH):
         return
@@ -77,11 +108,14 @@ def ensure_ssh_key():
         f.write(SSH_PRIVATE_KEY.replace("\n", "").strip() + "")
     os.chmod(SSH_KEY_PATH, 0o600)
 
+
 def get_tutor_value(key):
     return subprocess.check_output(f"tutor config printvalue {key}", shell=True).decode().strip()
 
+
 def get_tutor_root():
     return subprocess.check_output("tutor config printroot", shell=True).decode().strip()
+
 
 def verify_checksum(file_path, checksum_file):
     """Verify the checksum of a file against its checksum file."""
@@ -109,21 +143,20 @@ def verify_checksum(file_path, checksum_file):
         print(f"Got: {calculated_hash}")
         return False
 
+
 # ========= BACKUP RETRIEVAL =========
 
-def check_rsync_backup(backup_date=None, folder_name=None):
-    """Check if a backup exists on the rsync server and download it."""
-    if not REMOTE_SERVER or not REMOTE_PATH:
-        print("REMOTE_SERVER or REMOTE_PATH not set. Skipping rsync check.")
+def check_local_backup(backup_date=None, folder_name=None):
+    """Check if a backup exists locally in the same path where rsync stores backups."""
+    if not REMOTE_PATH:
+        print("REMOTE_PATH not set. Skipping local backup check.")
         return None
-
-    ensure_ssh_key()
 
     start_time = time.perf_counter()
 
     # If specific folder_name is provided, use it directly
     if folder_name:
-        remote_folder = folder_name
+        backup_folder = folder_name
     else:
         # If date is provided, construct folder name with that date
         if backup_date:
@@ -132,41 +165,50 @@ def check_rsync_backup(backup_date=None, folder_name=None):
             # Default to today's date
             date_str = datetime.now().strftime("%Y%m%d")
 
-        remote_folder = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{date_str}"
+        backup_folder = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{date_str}"
 
-    print(f"Checking for rsync backup in folder: {remote_folder}")
+    print(f"Checking for local backup in folder: {backup_folder}")
 
-    # Create local restore directory
-    restore_path = os.path.join(RESTORE_DIR, remote_folder)
+    # The complete path where backups are stored by the rsync in the backup script
+    local_backup_path = os.path.join(REMOTE_PATH, backup_folder)
+
+    if not os.path.exists(local_backup_path):
+        print(f"Local backup not found at: {local_backup_path}")
+        return None
+
+    # Check for required backup files
+    required_files = ["mysql_dump.tar.gz", "mongodb_dump.tar.gz", "openedx_media.tar.gz"]
+
+    missing_files = []
+    for file in required_files:
+        file_path = os.path.join(local_backup_path, file)
+        if not os.path.exists(file_path):
+            missing_files.append(file)
+
+    if missing_files:
+        print(f"Required files not found in local backup: {', '.join(missing_files)}")
+        return None
+
+    # Create restore directory
+    restore_path = os.path.join(RESTORE_DIR, backup_folder)
     if not os.path.exists(restore_path):
         os.makedirs(restore_path, exist_ok=True)
 
-    # Check if backup exists on remote server
-    check_cmd = f'ssh -i {SSH_KEY_PATH} {REMOTE_SERVER} "ls -la {REMOTE_PATH}/{remote_folder}/"'
-    try:
-        result = subprocess.run(check_cmd, shell=True, check=False, capture_output=True)
-        if result.returncode != 0:
-            print(f"Rsync backup not found: {remote_folder}")
-            return None
+    # Copy backup files to restore directory
+    for file in required_files:
+        src_file = os.path.join(local_backup_path, file)
+        dst_file = os.path.join(restore_path, file)
+        print(f"Copying {src_file} to {dst_file}")
+        shutil.copy2(src_file, dst_file)
 
-        # Check for required backup files
-        required_files = ["mysql_dump.tar.gz", "mongodb_dump.tar.gz", "openedx_media.tar.gz"]
+        # Copy checksum file if it exists
+        checksum_file = f"{src_file}.sha256"
+        if os.path.exists(checksum_file):
+            shutil.copy2(checksum_file, f"{dst_file}.sha256")
 
-        for file in required_files:
-            if file not in result.stdout.decode():
-                print(f"Required file {file} not found in rsync backup")
-                return None
+    log_time("Local backup copy", start_time)
+    return restore_path
 
-        # Download backup files
-        download_cmd = f'rsync -avz -e "ssh -i {SSH_KEY_PATH}" --progress {REMOTE_SERVER}:{REMOTE_PATH}/{remote_folder}/* {restore_path}/'
-        run(download_cmd)
-
-        log_time("Rsync backup download", start_time)
-        return restore_path
-
-    except Exception as e:
-        print(f"Error checking/downloading rsync backup: {e}")
-        return None
 
 def download_s3_backup(backup_date=None, folder_name=None):
     """Download backup from AWS S3."""
@@ -249,6 +291,7 @@ def download_s3_backup(backup_date=None, folder_name=None):
         print(f"Error downloading S3 backup: {e}")
         return None
 
+
 def download_gcs_backup(backup_date=None, folder_name=None):
     """Download backup from Google Cloud Storage."""
     if not GCP_SERVICE_ACCOUNT_JSON or not AWS_BUCKET_NAME:
@@ -329,6 +372,7 @@ def download_gcs_backup(backup_date=None, folder_name=None):
         print(f"Error downloading GCS backup: {e}")
         return None
 
+
 # ========= RESTORE FUNCTIONS =========
 
 def extract_tar(tar_file, extract_to):
@@ -360,6 +404,7 @@ def extract_tar(tar_file, extract_to):
             print(f"Fatal error extracting {tar_file} even with sudo: {e2}")
             return False
 
+
 def restore_mysql(mysql_dump_path):
     """Restore MySQL database from a dump file."""
     start_time = time.perf_counter()
@@ -375,17 +420,33 @@ def restore_mysql(mysql_dump_path):
         return False
 
     try:
-        # Import the SQL dump file
-        cmd = (
-            f'tutor local exec -e USERNAME="{username}" -e PASSWORD="{password}" -e DUMP_PATH="/var/lib/mysql/all-databases.sql" '
-            f'mysql sh -c \'mysql --user=$USERNAME --password=$PASSWORD < $DUMP_PATH\''
-        )
+        # Copy the SQL file to a location accessible by the MySQL container
+        tutor_root = get_tutor_root()
+        mysql_data_dir = os.path.join(tutor_root, "data/mysql")
+        target_sql_file = os.path.join(mysql_data_dir, "all-databases.sql")
+
+        # Make sure the target directory exists
+        os.makedirs(os.path.dirname(target_sql_file), exist_ok=True)
+
+        # Copy the SQL file
+        shutil.copy2(sql_file, target_sql_file)
+
+        # Use docker-compose directly with -T flag to avoid TTY issues
+        compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
+        project_name = "tutor_local"
+
+        cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T -e USERNAME={username} -e PASSWORD={password} mysql sh -c \"mysql --user=\\$USERNAME --password=\\$PASSWORD < /var/lib/mysql/all-databases.sql\""
         run(cmd)
+
+        # Clean up
+        os.remove(target_sql_file)
+
         log_time("MySQL restore", start_time)
         return True
     except Exception as e:
         print(f"Error restoring MySQL: {e}")
         return False
+
 
 def restore_mongodb(mongodb_dump_path):
     """Restore MongoDB from a dump directory."""
@@ -399,14 +460,40 @@ def restore_mongodb(mongodb_dump_path):
         return False
 
     try:
-        # Use mongorestore to restore the MongoDB database
-        cmd = f"tutor local exec mongodb mongorestore --drop /data/db/dump.mongodb"
+        # Copy the dump directory to a location accessible by the MongoDB container
+        tutor_root = get_tutor_root()
+        mongodb_data_dir = os.path.join(tutor_root, "data/mongodb")
+        target_dump_dir = os.path.join(mongodb_data_dir, "dump.mongodb")
+
+        # Remove existing dump directory if it exists
+        if os.path.exists(target_dump_dir):
+            try:
+                shutil.rmtree(target_dump_dir)
+            except Exception:
+                run(f"sudo rm -rf {target_dump_dir}")
+
+        # Copy the dump directory
+        shutil.copytree(dump_dir, target_dump_dir)
+
+        # Use docker-compose directly with -T flag to avoid TTY issues
+        compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
+        project_name = "tutor_local"
+
+        cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T mongodb mongorestore --drop /data/db/dump.mongodb"
         run(cmd)
+
+        # Clean up
+        try:
+            shutil.rmtree(target_dump_dir)
+        except Exception:
+            run(f"sudo rm -rf {target_dump_dir}")
+
         log_time("MongoDB restore", start_time)
         return True
     except Exception as e:
         print(f"Error restoring MongoDB: {e}")
         return False
+
 
 def restore_openedx_media(media_dir):
     """Restore OpenedX media files."""
@@ -435,15 +522,13 @@ def restore_openedx_media(media_dir):
         os.makedirs(target_dir, exist_ok=True)
 
         # Copy the media files
+        source_dir = media_dir
         if os.path.isdir(os.path.join(media_dir, "openedx-media")):
             # If the extract created a nested directory structure
             source_dir = os.path.join(media_dir, "openedx-media")
-            cmd = f"cp -r {source_dir}/* {target_dir}/"
-        else:
-            # If the extract has the files directly
-            cmd = f"cp -r {media_dir}/* {target_dir}/"
 
-        run(cmd)
+        # Use cp command for better handling of large directories
+        run(f"cp -r {source_dir}/* {target_dir}/")
 
         # Fix permissions
         run(f"sudo chown -R $USER:$USER {target_dir}")
@@ -462,6 +547,7 @@ def restore_openedx_media(media_dir):
             pass
         return False
 
+
 # ========= MAIN =========
 
 def main():
@@ -474,15 +560,15 @@ def main():
 
     install_requirements()
 
-    # Try to find a backup to restore, prioritizing rsync, then S3, then GCS
+    # Try to find a backup to restore, prioritizing local backup, then S3, then GCS
     backup_path = None
 
-    # First try rsync
-    backup_path = check_rsync_backup(args.date, args.folder)
+    # First try local backup (what was previously stored via rsync)
+    backup_path = check_local_backup(args.date, args.folder)
 
-    # If rsync backup not found, try S3
+    # If local backup not found, try S3
     if not backup_path:
-        print("Rsync backup not found or not accessible. Trying AWS S3...")
+        print("Local backup not found or not accessible. Trying AWS S3...")
         backup_path = download_s3_backup(args.date, args.folder)
 
     # If S3 backup not found, try GCS
@@ -556,6 +642,7 @@ def main():
 
     log_time("Total restore process", total_start_time)
     print("\n=== Restore process completed ===\n")
+
 
 if __name__ == "__main__":
     main()
