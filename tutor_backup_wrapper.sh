@@ -3,8 +3,20 @@
 # Script to properly run tutor backup/restore from crontab
 # Usage: ./tutor_backup_wrapper.sh [backup|restore] [additional args]
 
-# Determine user from environment or default to ubuntu
-USER=${BACKUP_USER:-ubuntu}
+# First, try to source .env file from current directory or common locations to get BACKUP_USER
+if [ -f ".env" ]; then
+    source .env
+elif [ -f "/home/$(whoami)/.local/share/tutor/.env" ]; then
+    # shellcheck disable=SC1090
+    source "/home/$(whoami)/.local/share/tutor/.env"
+elif [ -f "/home/ubuntu/.local/share/tutor/.env" ]; then
+    source "/home/ubuntu/.local/share/tutor/.env"
+elif [ -f "/home/sambaash/.local/share/tutor/.env" ]; then
+    source "/home/sambaash/.local/share/tutor/.env"
+fi
+
+# Determine user from environment, current user, or default to ubuntu
+USER=${BACKUP_USER:-$(whoami)}
 
 # Validate user
 if [[ "$USER" != "ubuntu" && "$USER" != "sambaash" ]]; then
@@ -12,11 +24,11 @@ if [[ "$USER" != "ubuntu" && "$USER" != "sambaash" ]]; then
     exit 1
 fi
 
-# Define paths
+# Define paths based on user
 SCRIPT_DIR="/home/$USER/.local/share/tutor"
 ENV_FILE="$SCRIPT_DIR/.env"
 LOG_FILE="$SCRIPT_DIR/tutor_backup.log"
-BACKUP_SCRIPT="$SCRIPT_DIR/tutor_backup_full.py"
+BACKUP_SCRIPT="$SCRIPT_DIR/tutor_backup.py"
 RESTORE_SCRIPT="$SCRIPT_DIR/tutor_restore.py"
 
 # Function for timestamped logging
