@@ -3,8 +3,17 @@
 # Script to properly run tutor backup/restore from crontab
 # Usage: ./tutor_backup_wrapper.sh [backup|restore] [additional args]
 
+# Determine user from environment or default to ubuntu
+USER=${BACKUP_USER:-ubuntu}
+
+# Validate user
+if [[ "$USER" != "ubuntu" && "$USER" != "sambaash" ]]; then
+    echo "Error: USER must be 'ubuntu' or 'sambaash', got: $USER"
+    exit 1
+fi
+
 # Define paths
-SCRIPT_DIR="/home/sambaash/.local/share/tutor"
+SCRIPT_DIR="/home/$USER/.local/share/tutor"
 ENV_FILE="$SCRIPT_DIR/.env"
 LOG_FILE="$SCRIPT_DIR/tutor_backup.log"
 BACKUP_SCRIPT="$SCRIPT_DIR/tutor_backup_full.py"
@@ -17,10 +26,10 @@ log() {
 
 # Immediately log the start
 log "-------------------------------------------"
-log "Starting backup wrapper script"
+log "Starting backup wrapper script for user: $USER"
 
 # Set home directory explicitly (important for cron)
-export HOME="/home/sambaash"
+export HOME="/home/$USER"
 log "HOME set to $HOME"
 
 # Source environment variables
