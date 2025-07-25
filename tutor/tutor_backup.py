@@ -337,9 +337,12 @@ def generate_checksum(file_path):
 def rsync_transfer(file_list, remote_folder):
     start_time = time.perf_counter()
     try:
+        # SSH options to disable host key checking
+        ssh_opts = f'-i {SSH_KEY_PATH} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
         # Ensure remote directory exists
-        run(f'ssh -i {SSH_KEY_PATH} {REMOTE_SERVER} "mkdir -p {REMOTE_PATH}/{remote_folder}"')
-        run(f'rsync -avz -e "ssh -i {SSH_KEY_PATH}" --progress {file_list} {REMOTE_SERVER}:{REMOTE_PATH}/{remote_folder}/')
+        run(f'ssh {ssh_opts} {REMOTE_SERVER} "mkdir -p {REMOTE_PATH}/{remote_folder}"')
+        run(f'rsync -avz -e "ssh {ssh_opts}" --progress {file_list} {REMOTE_SERVER}:{REMOTE_PATH}/{remote_folder}/')
         log_time("Rsync transfer", start_time)
         return True
     except Exception as e:

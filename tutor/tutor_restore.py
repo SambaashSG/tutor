@@ -81,23 +81,49 @@ def is_installed(command):
 
 
 def install_requirements():
-    pkgs = []
-    if not is_installed("aws"):
-        pkgs.append("awscli")
+    """Install required system packages and Python packages."""
+    # System packages that are essential
+    essential_pkgs = []
     if not is_installed("rsync"):
-        pkgs.append("rsync")
-    if pkgs:
-        run(f"sudo apt-get update && sudo apt-get install -y {' '.join(pkgs)}")
+        essential_pkgs.append("rsync")
 
+    # Install essential packages
+    if essential_pkgs:
+        try:
+            run(f"sudo apt-get update && sudo apt-get install -y {' '.join(essential_pkgs)}")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to install system packages: {e}")
+            print("Some functionality may be limited.")
+
+    # Install AWS CLI via snap if not available
+    if not is_installed("aws"):
+        try:
+            print("AWS CLI not found, attempting to install via snap...")
+            run("sudo snap install aws-cli --classic")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Could not install AWS CLI via snap: {e}")
+            print("S3 backup functionality will not be available.")
+
+    # Install Python packages
     try:
         import boto3
     except ImportError:
-        install_python_package("boto3")
+        try:
+            print("Installing boto3...")
+            install_python_package("boto3")
+        except Exception as e:
+            print(f"Warning: Could not install boto3: {e}")
+            print("S3 backup functionality will not be available.")
 
     try:
         from google.cloud import storage
     except ImportError:
-        install_python_package("google-cloud-storage")
+        try:
+            print("Installing google-cloud-storage...")
+            install_python_package("google-cloud-storage")
+        except Exception as e:
+            print(f"Warning: Could not install google-cloud-storage: {e}")
+            print("GCS backup functionality will not be available.")
 
 
 def ensure_ssh_key():
@@ -216,10 +242,16 @@ def download_s3_backup(backup_date=None, folder_name=None):
         print("AWS credentials or bucket not set. Skipping S3 check.")
         return None
 
+    # Check if boto3 is available
+    try:
+        import boto3
+    except ImportError:
+        print("boto3 not available. Skipping S3 check.")
+        return None
+
     start_time = time.perf_counter()
 
     try:
-        import boto3
         session = boto3.session.Session(
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -298,10 +330,16 @@ def download_gcs_backup(backup_date=None, folder_name=None):
         print("GCP credentials or bucket not set. Skipping GCS check.")
         return None
 
+    # Check if google-cloud-storage is available
+    try:
+        from google.cloud import storage
+    except ImportError:
+        print("google-cloud-storage not available. Skipping GCS check.")
+        return None
+
     start_time = time.perf_counter()
 
     try:
-        from google.cloud import storage
         key_path = "/tmp/gcp_service_account.json"
         with open(key_path, "w") as f:
             json.dump(json.loads(GCP_SERVICE_ACCOUNT_JSON), f)
@@ -558,90 +596,114 @@ def main():
 
     total_start_time = time.perf_counter()
 
-    install_requirements()
-
-    # Try to find a backup to restore, prioritizing local backup, then S3, then GCS
-    backup_path = None
-
-    # First try local backup (what was previously stored via rsync)
-    backup_path = check_local_backup(args.date, args.folder)
-
-    # If local backup not found, try S3
-    if not backup_path:
-        print("Local backup not found or not accessible. Trying AWS S3...")
-        backup_path = download_s3_backup(args.date, args.folder)
-
-    # If S3 backup not found, try GCS
-    if not backup_path:
-        print("AWS S3 backup not found or not accessible. Trying Google Cloud Storage...")
-        backup_path = download_gcs_backup(args.date, args.folder)
-
-    # If still no backup found, exit
-    if not backup_path:
-        print("Error: No backup found to restore. Please check backup date or folder name.")
-        sys.exit(1)
-
-    print(f"Found backup at: {backup_path}")
-
-    # Extract directories for backup files
-    mysql_tar = os.path.join(backup_path, "mysql_dump.tar.gz")
-    mongodb_tar = os.path.join(backup_path, "mongodb_dump.tar.gz")
-    openedx_media_tar = os.path.join(backup_path, "openedx_media.tar.gz")
-
-    # Verify checksums if available
-    for tar_file in [mysql_tar, mongodb_tar, openedx_media_tar]:
-        if os.path.exists(tar_file) and os.path.exists(f"{tar_file}.sha256"):
-            verify_checksum(tar_file, f"{tar_file}.sha256")
-
-    # Create extraction directories
-    mysql_extract_dir = os.path.join(backup_path, "mysql_extract")
-    mongodb_extract_dir = os.path.join(backup_path, "mongodb_extract")
-    openedx_media_extract_dir = os.path.join(backup_path, "openedx_media_extract")
-
-    # Extract all backup files
-    extract_tar(mysql_tar, mysql_extract_dir)
-    extract_tar(mongodb_tar, mongodb_extract_dir)
-    extract_tar(openedx_media_tar, openedx_media_extract_dir)
-
-    # Perform restore operations
-    print("\n=== Starting restore process ===\n")
-
-    # Restore MySQL
-    print("\n=== Restoring MySQL database ===\n")
-    if restore_mysql(mysql_extract_dir):
-        print("MySQL restore completed successfully")
-    else:
-        print("MySQL restore failed")
-
-    # Restore MongoDB
-    print("\n=== Restoring MongoDB database ===\n")
-    if restore_mongodb(mongodb_extract_dir):
-        print("MongoDB restore completed successfully")
-    else:
-        print("MongoDB restore failed")
-
-    # Restore OpenedX media
-    print("\n=== Restoring OpenedX media files ===\n")
-    if restore_openedx_media(openedx_media_extract_dir):
-        print("OpenedX media restore completed successfully")
-    else:
-        print("OpenedX media restore failed")
-
-    # Clean up
     try:
-        print("\n=== Cleaning up temporary files ===\n")
-        shutil.rmtree(backup_path)
-        print(f"Removed temporary restore directory: {backup_path}")
-    except Exception as e:
-        print(f"Warning: Could not remove restore directory {backup_path}: {e}")
-        try:
-            run(f"sudo rm -rf {backup_path}")
-            print(f"Removed temporary restore directory with sudo: {backup_path}")
-        except Exception as e2:
-            print(f"Error: Failed to remove restore directory even with sudo: {e2}")
+        print("Starting restore process...")
+        print(f"Current working directory: {os.getcwd()}")
+        print(f"Arguments: date={args.date}, folder={args.folder}")
 
-    log_time("Total restore process", total_start_time)
-    print("\n=== Restore process completed ===\n")
+        install_requirements()
+        print("Requirements installation completed")
+
+        # Try to find a backup to restore, prioritizing local backup, then S3, then GCS
+        backup_path = None
+
+        # First try local backup (what was previously stored via rsync)
+        print("Checking for local backup...")
+        backup_path = check_local_backup(args.date, args.folder)
+
+        # If local backup not found, try S3
+        if not backup_path:
+            print("Local backup not found or not accessible. Trying AWS S3...")
+            backup_path = download_s3_backup(args.date, args.folder)
+
+        # If S3 backup not found, try GCS
+        if not backup_path:
+            print("AWS S3 backup not found or not accessible. Trying Google Cloud Storage...")
+            backup_path = download_gcs_backup(args.date, args.folder)
+
+        # If still no backup found, exit
+        if not backup_path:
+            print("Error: No backup found to restore. Please check backup date or folder name.")
+            print(f"Searched for:")
+            print(f"  - Date: {args.date or 'today'}")
+            print(f"  - Folder: {args.folder or 'auto-generated'}")
+            print(f"  - REMOTE_PATH: {REMOTE_PATH}")
+            print(f"  - AWS_BUCKET_NAME: {AWS_BUCKET_NAME}")
+            sys.exit(1)
+
+        print(f"Found backup at: {backup_path}")
+
+        # Extract directories for backup files
+        mysql_tar = os.path.join(backup_path, "mysql_dump.tar.gz")
+        mongodb_tar = os.path.join(backup_path, "mongodb_dump.tar.gz")
+        openedx_media_tar = os.path.join(backup_path, "openedx_media.tar.gz")
+
+        print(f"Looking for backup files:")
+        print(f"  - MySQL: {mysql_tar} (exists: {os.path.exists(mysql_tar)})")
+        print(f"  - MongoDB: {mongodb_tar} (exists: {os.path.exists(mongodb_tar)})")
+        print(f"  - Media: {openedx_media_tar} (exists: {os.path.exists(openedx_media_tar)})")
+
+        # Verify checksums if available
+        for tar_file in [mysql_tar, mongodb_tar, openedx_media_tar]:
+            if os.path.exists(tar_file) and os.path.exists(f"{tar_file}.sha256"):
+                verify_checksum(tar_file, f"{tar_file}.sha256")
+
+        # Create extraction directories
+        mysql_extract_dir = os.path.join(backup_path, "mysql_extract")
+        mongodb_extract_dir = os.path.join(backup_path, "mongodb_extract")
+        openedx_media_extract_dir = os.path.join(backup_path, "openedx_media_extract")
+
+        # Extract all backup files
+        print("Extracting backup files...")
+        extract_tar(mysql_tar, mysql_extract_dir)
+        extract_tar(mongodb_tar, mongodb_extract_dir)
+        extract_tar(openedx_media_tar, openedx_media_extract_dir)
+
+        # Perform restore operations
+        print("\n=== Starting restore process ===\n")
+
+        # Restore MySQL
+        print("\n=== Restoring MySQL database ===\n")
+        if restore_mysql(mysql_extract_dir):
+            print("MySQL restore completed successfully")
+        else:
+            print("MySQL restore failed")
+
+        # Restore MongoDB
+        print("\n=== Restoring MongoDB database ===\n")
+        if restore_mongodb(mongodb_extract_dir):
+            print("MongoDB restore completed successfully")
+        else:
+            print("MongoDB restore failed")
+
+        # Restore OpenedX media
+        print("\n=== Restoring OpenedX media files ===\n")
+        if restore_openedx_media(openedx_media_extract_dir):
+            print("OpenedX media restore completed successfully")
+        else:
+            print("OpenedX media restore failed")
+
+        # Clean up
+        try:
+            print("\n=== Cleaning up temporary files ===\n")
+            shutil.rmtree(backup_path)
+            print(f"Removed temporary restore directory: {backup_path}")
+        except Exception as e:
+            print(f"Warning: Could not remove restore directory {backup_path}: {e}")
+            try:
+                run(f"sudo rm -rf {backup_path}")
+                print(f"Removed temporary restore directory with sudo: {backup_path}")
+            except Exception as e2:
+                print(f"Error: Failed to remove restore directory even with sudo: {e2}")
+
+        log_time("Total restore process", total_start_time)
+        print("\n=== Restore process completed ===\n")
+
+    except Exception as e:
+        print(f"FATAL ERROR in restore process: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
