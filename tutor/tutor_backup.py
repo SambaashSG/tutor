@@ -281,6 +281,48 @@ def compress_tar_fast(directory, output_file):
     return output_file
 
 
+def compress_tar_exclude(args):
+    """Compress directory with exclusions"""
+    directory, output_file, exclude_dirs = args
+    start_time = time.perf_counter()
+    print(f"Compressing {directory} to {output_file} (excluding: {', '.join(exclude_dirs) if exclude_dirs else 'none'})")
+
+    # Check if directory exists
+    if not os.path.exists(directory):
+        print(f"Warning: Directory {directory} does not exist. Skipping compression.")
+        return None
+
+    try:
+        # Build exclude options for tar
+        exclude_opts = ""
+        if exclude_dirs:
+            for exclude_dir in exclude_dirs:
+                exclude_opts += f" --exclude='{exclude_dir}'"
+
+        # Use tar command with exclude options
+        cmd = f"tar -czf {output_file} -C {os.path.dirname(directory)} {exclude_opts} {os.path.basename(directory)}"
+        run(cmd)
+
+    except Exception as e:
+        print(f"Warning: Error compressing {directory}: {e}")
+        # Try with sudo
+        try:
+            exclude_opts = ""
+            if exclude_dirs:
+                for exclude_dir in exclude_dirs:
+                    exclude_opts += f" --exclude='{exclude_dir}'"
+
+            cmd = f"sudo tar -czf {output_file} -C {os.path.dirname(directory)} {exclude_opts} {os.path.basename(directory)}"
+            run(cmd)
+            run(f"sudo chown $USER:$USER {output_file}")
+        except Exception as e2:
+            print(f"Fatal error compressing {directory}: {e2}")
+            raise
+
+    log_time(f"Compression of {os.path.basename(output_file)}", start_time)
+    return output_file
+
+
 def compress_tar(args):
     directory, output_file = args
     start_time = time.perf_counter()
@@ -518,11 +560,18 @@ def main():
     print("Starting MongoDB dump...")
     mongodb_dump_dir = mongodb_dump()
 
+    # Get tutor root and parent directory for tutor config and plugins
+    tutor_root = get_tutor_root()
+    tutor_parent = os.path.dirname(tutor_root)
+    tutor_plugins_dir = os.path.join(tutor_parent, "tutor-plugins")
+
     # Set up compression tasks
     mysql_dump_file = os.path.join(backup_path, "mysql_dump.tar.gz")
     mongodb_tar_file = os.path.join(backup_path, "mongodb_dump.tar.gz")
     openedx_media_dir = os.path.join(get_tutor_root(), "data/openedx-media")
     openedx_tar_file = os.path.join(backup_path, "openedx_media.tar.gz")
+    tutor_config_tar_file = os.path.join(backup_path, "tutor_config.tar.gz")
+    tutor_plugins_tar_file = os.path.join(backup_path, "tutor_plugins.tar.gz")
 
     compression_tasks = [
         (mysql_dump_dir, mysql_dump_file),
@@ -530,8 +579,22 @@ def main():
         (openedx_media_dir, openedx_tar_file)
     ]
 
+    # Add tutor config backup (excluding data folder)
+    compression_tasks_with_excludes = [
+        (tutor_root, tutor_config_tar_file, ["data"])
+    ]
+
+    # Add tutor-plugins backup if directory exists
+    if os.path.exists(tutor_plugins_dir):
+        compression_tasks.append((tutor_plugins_dir, tutor_plugins_tar_file))
+        print(f"Found tutor-plugins directory: {tutor_plugins_dir}")
+    else:
+        print(f"Warning: tutor-plugins directory not found at {tutor_plugins_dir}")
+
     # Run compression in parallel with ThreadPoolExecutor
     files_to_transfer = []
+
+    # Handle regular compression tasks
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
         future_to_task = {executor.submit(compress_tar, task): task for task in compression_tasks}
         for future in concurrent.futures.as_completed(future_to_task):
@@ -542,6 +605,18 @@ def main():
             except Exception as e:
                 task = future_to_task[future]
                 print(f"Compression task failed for {task[0]}: {e}")
+
+    # Handle compression tasks with excludes
+    with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        future_to_task = {executor.submit(compress_tar_exclude, task): task for task in compression_tasks_with_excludes}
+        for future in concurrent.futures.as_completed(future_to_task):
+            try:
+                result = future.result()
+                if result:
+                    files_to_transfer.append(result)
+            except Exception as e:
+                task = future_to_task[future]
+                print(f"Compression task with excludes failed for {task[0]}: {e}")
 
     # Transfer compressed files
     transfer_files(files_to_transfer, folder_name, targets)
