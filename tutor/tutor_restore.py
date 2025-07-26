@@ -10,6 +10,8 @@ import tarfile
 import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========= LOAD ENVIRONMENT =========
 
@@ -39,21 +41,25 @@ GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
 RESTORE_DIR = "/tmp/tutor-restore"
 
+# Thread lock for logging
+log_lock = threading.Lock()
 
 # ========= UTILS =========
 
 def log_time(message, start_time):
     elapsed = time.perf_counter() - start_time
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message} completed in {elapsed:.2f} seconds.")
-    sys.stdout.flush()
+    with log_lock:
+        print(f"[{timestamp}] {message} completed in {elapsed:.2f} seconds.")
+        sys.stdout.flush()
 
 
 def log_message(message):
     """Log a message with timestamp and immediate flush"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
-    sys.stdout.flush()
+    with log_lock:
+        print(f"[{timestamp}] {message}")
+        sys.stdout.flush()
 
 
 def run(cmd, check=True, real_time_output=True):
@@ -73,10 +79,11 @@ def run(cmd, check=True, real_time_output=True):
                 universal_newlines=True
             )
 
-            # Print output in real-time
+            # Print output in real-time with thread safety
             for line in iter(process.stdout.readline, ''):
-                print(line.rstrip())
-                sys.stdout.flush()
+                with log_lock:
+                    print(line.rstrip())
+                    sys.stdout.flush()
 
             process.wait()
 
@@ -95,7 +102,8 @@ def run(cmd, check=True, real_time_output=True):
                 text=True
             )
             if process.stdout:
-                print(f"STDOUT: {process.stdout}")
+                with log_lock:
+                    print(f"STDOUT: {process.stdout}")
             return process
 
     except subprocess.CalledProcessError as e:
@@ -185,6 +193,9 @@ def verify_checksum(file_path, checksum_file):
         log_message(f"Warning: Checksum file {checksum_file} not found. Skipping verification.")
         return True
 
+    start_time = time.perf_counter()
+    log_message(f"Verifying checksum for {os.path.basename(file_path)}...")
+
     sha256_hash = hashlib.sha256()
     with open(file_path, "rb") as f:
         for byte_block in iter(lambda: f.read(4096), b""):
@@ -197,13 +208,95 @@ def verify_checksum(file_path, checksum_file):
         stored_hash = checksum_line.split()[0]
 
     if calculated_hash == stored_hash:
-        log_message(f"Checksum verified for {os.path.basename(file_path)}")
+        log_time(f"Checksum verification for {os.path.basename(file_path)}", start_time)
         return True
     else:
         log_message(f"Warning: Checksum mismatch for {os.path.basename(file_path)}")
         log_message(f"Expected: {stored_hash}")
         log_message(f"Got: {calculated_hash}")
         return False
+
+
+def verify_checksums_parallel(tar_files):
+    """Verify checksums for multiple files in parallel."""
+    log_message("Starting parallel checksum verification...")
+    start_time = time.perf_counter()
+
+    # Filter files that have checksums
+    files_to_verify = [(tar_file, f"{tar_file}.sha256") for tar_file in tar_files
+                       if os.path.exists(tar_file) and os.path.exists(f"{tar_file}.sha256")]
+
+    if not files_to_verify:
+        log_message("No checksum files found, skipping verification.")
+        return
+
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_file = {executor.submit(verify_checksum, file_path, checksum_file): file_path
+                          for file_path, checksum_file in files_to_verify}
+
+        for future in as_completed(future_to_file):
+            file_path = future_to_file[future]
+            try:
+                result = future.result()
+                results.append((file_path, result))
+            except Exception as exc:
+                log_message(f"Checksum verification for {file_path} generated an exception: {exc}")
+                results.append((file_path, False))
+
+    log_time("Parallel checksum verification", start_time)
+
+    # Report results
+    for file_path, result in results:
+        if result:
+            log_message(f"✓ Checksum verified: {os.path.basename(file_path)}")
+        else:
+            log_message(f"✗ Checksum failed: {os.path.basename(file_path)}")
+
+
+def extract_tar_with_name(args):
+    """Wrapper function for extract_tar to work with ThreadPoolExecutor"""
+    tar_file, extract_to, name = args
+    log_message(f"Starting extraction of {name}...")
+    result = extract_tar(tar_file, extract_to)
+    if result:
+        log_message(f"✓ Completed extraction of {name}")
+    else:
+        log_message(f"✗ Failed extraction of {name}")
+    return result, name
+
+
+def extract_files_parallel(extraction_tasks):
+    """Extract multiple tar files in parallel."""
+    log_message("Starting parallel extraction...")
+    start_time = time.perf_counter()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_task = {executor.submit(extract_tar_with_name, task): task[2]
+                          for task in extraction_tasks}
+
+        for future in as_completed(future_to_task):
+            task_name = future_to_task[future]
+            try:
+                result, name = future.result()
+                results.append((name, result))
+            except Exception as exc:
+                log_message(f"Extraction for {task_name} generated an exception: {exc}")
+                results.append((task_name, False))
+
+    log_time("Parallel extraction", start_time)
+
+    # Report results
+    all_successful = True
+    for name, result in results:
+        if result:
+            log_message(f"✓ Extraction successful: {name}")
+        else:
+            log_message(f"✗ Extraction failed: {name}")
+            all_successful = False
+
+    return all_successful
 
 
 # ========= BACKUP RETRIEVAL =========
@@ -436,7 +529,6 @@ def download_gcs_backup(backup_date=None, folder_name=None):
 def extract_tar(tar_file, extract_to):
     """Extract a tar file to the specified directory."""
     start_time = time.perf_counter()
-    log_message(f"Extracting {tar_file} to {extract_to}")
 
     os.makedirs(extract_to, exist_ok=True)
 
@@ -454,8 +546,8 @@ def extract_tar(tar_file, extract_to):
         # Try with sudo
         try:
             cmd = f"sudo tar -xzf {tar_file} -C {extract_to}"
-            run(cmd)
-            run(f"sudo chown -R $USER:$USER {extract_to}")
+            run(cmd, real_time_output=False)
+            run(f"sudo chown -R $USER:$USER {extract_to}", real_time_output=False)
             log_time(f"Extraction of {os.path.basename(tar_file)} with sudo", start_time)
             return True
         except Exception as e2:
@@ -463,10 +555,91 @@ def extract_tar(tar_file, extract_to):
             return False
 
 
+def restore_with_name(args):
+    """Wrapper function for restore operations to work with ThreadPoolExecutor"""
+    restore_func, restore_path, name = args
+    log_message(f"Starting {name} restore...")
+    start_time = time.perf_counter()
+
+    try:
+        result = restore_func(restore_path)
+        if result:
+            log_time(f"{name} restore", start_time)
+            log_message(f"✓ {name} restore completed successfully")
+        else:
+            log_message(f"✗ {name} restore failed")
+        return result, name
+    except Exception as e:
+        log_message(f"✗ {name} restore failed with exception: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, name
+
+
+def restore_all_parallel(restore_tasks):
+    """Restore all services in parallel."""
+    log_message("Starting parallel restore operations...")
+    start_time = time.perf_counter()
+
+    # Special handling: OpenedX media restore stops/starts tutor services
+    # So we need to handle it separately to avoid conflicts
+
+    # Separate media restore from database restores
+    db_tasks = []
+    media_task = None
+
+    for task in restore_tasks:
+        restore_func, restore_path, name = task
+        if name == "OpenedX Media":
+            media_task = task
+        else:
+            db_tasks.append(task)
+
+    results = []
+
+    # First, run database restores in parallel
+    if db_tasks:
+        log_message("Running database restores in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_to_task = {executor.submit(restore_with_name, task): task[2]
+                              for task in db_tasks}
+
+            for future in as_completed(future_to_task):
+                task_name = future_to_task[future]
+                try:
+                    result, name = future.result()
+                    results.append((name, result))
+                except Exception as exc:
+                    log_message(f"Database restore for {task_name} generated an exception: {exc}")
+                    results.append((task_name, False))
+
+    # Then run media restore (which stops/starts services)
+    if media_task:
+        log_message("Running media restore...")
+        try:
+            result, name = restore_with_name(media_task)
+            results.append((name, result))
+        except Exception as exc:
+            log_message(f"Media restore generated an exception: {exc}")
+            results.append(("OpenedX Media", False))
+
+    log_time("Parallel restore operations", start_time)
+
+    # Report final results
+    all_successful = True
+    for name, result in results:
+        if result:
+            log_message(f"✓ Final status - {name}: SUCCESS")
+        else:
+            log_message(f"✗ Final status - {name}: FAILED")
+            all_successful = False
+
+    return all_successful
+
+
 def restore_mysql(mysql_dump_path):
     """Restore MySQL database from a dump file using the tutor local exec command."""
     start_time = time.perf_counter()
-    log_message("Starting MySQL restore process...")
 
     username = get_tutor_value("MYSQL_ROOT_USERNAME")
     password = get_tutor_value("MYSQL_ROOT_PASSWORD")
@@ -479,7 +652,7 @@ def restore_mysql(mysql_dump_path):
         return False
 
     try:
-        # Copy the SQL file to a location accessible by the MySQL container
+        # Move the SQL file to a location accessible by the MySQL container
         tutor_root = get_tutor_root()
         mysql_data_dir = os.path.join(tutor_root, "data/mysql")
         target_sql_file = os.path.join(mysql_data_dir, "all-databases.sql")
@@ -487,8 +660,8 @@ def restore_mysql(mysql_dump_path):
         # Make sure the target directory exists
         os.makedirs(os.path.dirname(target_sql_file), exist_ok=True)
 
-        log_message(f"Copying SQL file from {sql_file} to {target_sql_file}")
-        shutil.copy2(sql_file, target_sql_file)
+        log_message(f"Moving SQL file from {sql_file} to {target_sql_file}")
+        shutil.move(sql_file, target_sql_file)
 
         # Use the tutor local exec command as you specified
         log_message("Executing MySQL restore command...")
@@ -498,10 +671,9 @@ def restore_mysql(mysql_dump_path):
 
         # Clean up
         log_message("Cleaning up temporary SQL file...")
-        os.remove(target_sql_file)
+        if os.path.exists(target_sql_file):
+            os.remove(target_sql_file)
 
-        log_time("MySQL restore", start_time)
-        log_message("MySQL restore completed successfully")
         return True
     except Exception as e:
         log_message(f"Error restoring MySQL: {e}")
@@ -513,7 +685,6 @@ def restore_mysql(mysql_dump_path):
 def restore_mongodb(mongodb_dump_path):
     """Restore MongoDB from a dump directory using direct docker exec command."""
     start_time = time.perf_counter()
-    log_message("Starting MongoDB restore process...")
 
     # The expected path to the MongoDB dump directory
     dump_dir = os.path.join(mongodb_dump_path, "dump.mongodb")
@@ -523,7 +694,7 @@ def restore_mongodb(mongodb_dump_path):
         return False
 
     try:
-        # Copy the dump directory to a location accessible by the MongoDB container
+        # Move the dump directory to a location accessible by the MongoDB container
         tutor_root = get_tutor_root()
         mongodb_data_dir = os.path.join(tutor_root, "data/mongodb")
         target_dump_dir = os.path.join(mongodb_data_dir, "dump.mongodb")
@@ -533,10 +704,10 @@ def restore_mongodb(mongodb_dump_path):
             try:
                 shutil.rmtree(target_dump_dir)
             except Exception:
-                run(f"sudo rm -rf {target_dump_dir}")
+                run(f"sudo rm -rf {target_dump_dir}", real_time_output=False)
 
-        log_message(f"Copying MongoDB dump from {dump_dir} to {target_dump_dir}")
-        shutil.copytree(dump_dir, target_dump_dir)
+        log_message(f"Moving MongoDB dump from {dump_dir} to {target_dump_dir}")
+        shutil.move(dump_dir, target_dump_dir)
 
         # First, drop all existing databases
         log_message("Dropping all existing MongoDB databases...")
@@ -562,9 +733,6 @@ def restore_mongodb(mongodb_dump_path):
         # Use the direct docker exec command for MongoDB restore
         log_message("Executing MongoDB restore command...")
 
-        # Create a log file for the restore process
-        restore_log = "/tmp/mongorestore.log"
-
         # Use the command you specified but with real-time monitoring
         restore_cmd = f'docker exec tutor_local_mongodb_1 mongorestore --drop /data/db/dump.mongodb'
 
@@ -576,10 +744,8 @@ def restore_mongodb(mongodb_dump_path):
         try:
             shutil.rmtree(target_dump_dir)
         except Exception:
-            run(f"sudo rm -rf {target_dump_dir}")
+            run(f"sudo rm -rf {target_dump_dir}", real_time_output=False)
 
-        log_time("MongoDB restore", start_time)
-        log_message("MongoDB restore completed successfully")
         return True
 
     except Exception as e:
@@ -588,10 +754,10 @@ def restore_mongodb(mongodb_dump_path):
         traceback.print_exc()
         return False
 
+
 def restore_openedx_media(media_dir):
     """Restore OpenedX media files."""
     start_time = time.perf_counter()
-    log_message("Starting OpenedX media restore process...")
 
     tutor_root = get_tutor_root()
     target_dir = os.path.join(tutor_root, "data/openedx-media")
@@ -611,31 +777,29 @@ def restore_openedx_media(media_dir):
             try:
                 shutil.rmtree(target_dir)
             except Exception:
-                run(f"sudo rm -rf {target_dir}")
+                run(f"sudo rm -rf {target_dir}", real_time_output=False)
 
         # Create the target directory
         os.makedirs(target_dir, exist_ok=True)
 
-        # Copy the media files
+        # Move the media files
         source_dir = media_dir
         if os.path.isdir(os.path.join(media_dir, "openedx-media")):
             # If the extract created a nested directory structure
             source_dir = os.path.join(media_dir, "openedx-media")
 
-        log_message(f"Copying media files from {source_dir} to {target_dir}")
-        # Use cp command for better handling of large directories
-        run(f"cp -r {source_dir}/* {target_dir}/")
+        log_message(f"Moving media files from {source_dir} to {target_dir}")
+        # Use mv command for better handling of large directories
+        run(f"mv {source_dir}/* {target_dir}/", real_time_output=False)
 
         # Fix permissions
         log_message("Fixing permissions...")
-        run(f"sudo chown -R $USER:$USER {target_dir}")
+        run(f"sudo chown -R $USER:$USER {target_dir}", real_time_output=False)
 
         # Start Tutor services
         log_message("Starting Tutor services...")
         run("tutor local start")
 
-        log_time("OpenedX media restore", start_time)
-        log_message("OpenedX media restore completed successfully")
         return True
     except Exception as e:
         log_message(f"Error restoring OpenedX media: {e}")
@@ -707,45 +871,40 @@ def main():
         log_message(f"  - MongoDB: {mongodb_tar} (exists: {os.path.exists(mongodb_tar)})")
         log_message(f"  - Media: {openedx_media_tar} (exists: {os.path.exists(openedx_media_tar)})")
 
-        # Verify checksums if available
-        for tar_file in [mysql_tar, mongodb_tar, openedx_media_tar]:
-            if os.path.exists(tar_file) and os.path.exists(f"{tar_file}.sha256"):
-                verify_checksum(tar_file, f"{tar_file}.sha256")
+        # Verify checksums in parallel
+        verify_checksums_parallel([mysql_tar, mongodb_tar, openedx_media_tar])
 
         # Create extraction directories
         mysql_extract_dir = os.path.join(backup_path, "mysql_extract")
         mongodb_extract_dir = os.path.join(backup_path, "mongodb_extract")
         openedx_media_extract_dir = os.path.join(backup_path, "openedx_media_extract")
 
-        # Extract all backup files
-        log_message("Extracting backup files...")
-        extract_tar(mysql_tar, mysql_extract_dir)
-        extract_tar(mongodb_tar, mongodb_extract_dir)
-        extract_tar(openedx_media_tar, openedx_media_extract_dir)
+        # Extract all backup files in parallel
+        extraction_tasks = [
+            (mysql_tar, mysql_extract_dir, "MySQL"),
+            (mongodb_tar, mongodb_extract_dir, "MongoDB"),
+            (openedx_media_tar, openedx_media_extract_dir, "OpenedX Media")
+        ]
 
-        # Perform restore operations
-        log_message("\n=== Starting restore process ===\n")
+        if not extract_files_parallel(extraction_tasks):
+            log_message("Some extractions failed. Check the logs above.")
+            sys.exit(1)
 
-        # Restore MySQL
-        log_message("\n=== Restoring MySQL database ===\n")
-        if restore_mysql(mysql_extract_dir):
-            log_message("MySQL restore completed successfully")
+        # Perform restore operations in parallel
+        log_message("\n=== Starting parallel restore process ===\n")
+
+        # Prepare restore tasks
+        restore_tasks = [
+            (restore_mysql, mysql_extract_dir, "MySQL"),
+            (restore_mongodb, mongodb_extract_dir, "MongoDB"),
+            (restore_openedx_media, openedx_media_extract_dir, "OpenedX Media")
+        ]
+
+        # Run all restores in parallel (with special handling for media)
+        if restore_all_parallel(restore_tasks):
+            log_message("All restore operations completed successfully!")
         else:
-            log_message("MySQL restore failed")
-
-        # Restore MongoDB
-        log_message("\n=== Restoring MongoDB database ===\n")
-        if restore_mongodb(mongodb_extract_dir):
-            log_message("MongoDB restore completed successfully")
-        else:
-            log_message("MongoDB restore failed")
-
-        # Restore OpenedX media
-        log_message("\n=== Restoring OpenedX media files ===\n")
-        if restore_openedx_media(openedx_media_extract_dir):
-            log_message("OpenedX media restore completed successfully")
-        else:
-            log_message("OpenedX media restore failed")
+            log_message("Some restore operations failed. Check the logs above.")
 
         # Clean up only if backup was downloaded (not local)
         if backup_path.startswith(RESTORE_DIR):
@@ -756,7 +915,7 @@ def main():
             except Exception as e:
                 log_message(f"Warning: Could not remove restore directory {backup_path}: {e}")
                 try:
-                    run(f"sudo rm -rf {backup_path}")
+                    run(f"sudo rm -rf {backup_path}", real_time_output=False)
                     log_message(f"Removed temporary restore directory with sudo: {backup_path}")
                 except Exception as e2:
                     log_message(f"Error: Failed to remove restore directory even with sudo: {e2}")
