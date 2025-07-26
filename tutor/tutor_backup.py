@@ -56,13 +56,22 @@ USE_FAST_COMPRESSION = os.getenv("USE_FAST_COMPRESSION", "true").lower() in ("tr
 
 def log_time(message, start_time):
     elapsed = time.perf_counter() - start_time
-    print(f"[{message}] completed in {elapsed:.2f} seconds.")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message} completed in {elapsed:.2f} seconds.")
+    sys.stdout.flush()
+
+
+def log_message(message):
+    """Log a message with timestamp and immediate flush"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
 
 
 
 def run(cmd, check=True):
     """Run a shell command with better error handling"""
-    print(f"Running: {cmd}")
+    log_message(f"Running: {cmd}")
     try:
         process = subprocess.run(
             cmd,
@@ -73,14 +82,14 @@ def run(cmd, check=True):
             text=True  # Get string output instead of bytes
         )
         if process.stdout:
-            print(f"STDOUT: {process.stdout}")
+            log_message(f"STDOUT: {process.stdout}")
         return process
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Command failed with status {e.returncode}")
+        log_message(f"ERROR: Command failed with status {e.returncode}")
         if e.stdout:
-            print(f"STDOUT: {e.stdout}")
+            log_message(f"STDOUT: {e.stdout}")
         if e.stderr:
-            print(f"STDERR: {e.stderr}")
+            log_message(f"STDERR: {e.stderr}")
         if check:
             raise
 
@@ -163,16 +172,16 @@ def mysql_dump():
     max_attempts = 1
     for attempt in range(1, max_attempts + 1):
         try:
-            print(f"MySQL dump attempt {attempt}/{max_attempts}")
+            log_message(f"MySQL dump attempt {attempt}/{max_attempts}")
             run(cmd)
             break  # If successful, break out of the retry loop
         except Exception as e:
-            print(f"MySQL dump attempt {attempt} failed: {e}")
+            log_message(f"MySQL dump attempt {attempt} failed: {e}")
             if attempt == max_attempts:
-                print("All MySQL dump attempts failed")
+                log_message("All MySQL dump attempts failed")
                 raise  # Re-raise the last exception after all attempts fail
             else:
-                print(f"Waiting 30 seconds before retry...")
+                log_message(f"Waiting 30 seconds before retry...")
                 time.sleep(30)  # Wait before retry
 
     dump_file = os.path.join(get_tutor_root(), "data/mysql/all-databases.sql")
@@ -200,17 +209,17 @@ def mongodb_dump():
     max_attempts = 1
     for attempt in range(1, max_attempts + 1):
         try:
-            print(f"MongoDB dump attempt {attempt}/{max_attempts}")
+            log_message(f"MongoDB dump attempt {attempt}/{max_attempts}")
             cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T mongodb mongodump --out=/data/db/dump.mongodb"
             run(cmd)
             break  # If successful, break out of the retry loop
         except Exception as e:
-            print(f"MongoDB dump attempt {attempt} failed: {e}")
+            log_message(f"MongoDB dump attempt {attempt} failed: {e}")
             if attempt == max_attempts:
-                print("All MongoDB dump attempts failed")
+                log_message("All MongoDB dump attempts failed")
                 raise  # Re-raise the last exception after all attempts fail
             else:
-                print(f"Waiting 30 seconds before retry...")
+                log_message(f"Waiting 30 seconds before retry...")
                 time.sleep(30)  # Wait before retry
 
     dump_path = os.path.join(get_tutor_root(), "data/mongodb/dump.mongodb")
@@ -285,11 +294,11 @@ def compress_tar_exclude(args):
     """Compress directory with exclusions"""
     directory, output_file, exclude_dirs = args
     start_time = time.perf_counter()
-    print(f"Compressing {directory} to {output_file} (excluding: {', '.join(exclude_dirs) if exclude_dirs else 'none'})")
+    log_message(f"Compressing {directory} to {output_file} (excluding: {', '.join(exclude_dirs) if exclude_dirs else 'none'})")
 
     # Check if directory exists
     if not os.path.exists(directory):
-        print(f"Warning: Directory {directory} does not exist. Skipping compression.")
+        log_message(f"Warning: Directory {directory} does not exist. Skipping compression.")
         return None
 
     try:
@@ -304,7 +313,7 @@ def compress_tar_exclude(args):
         run(cmd)
 
     except Exception as e:
-        print(f"Warning: Error compressing {directory}: {e}")
+        log_message(f"Warning: Error compressing {directory}: {e}")
         # Try with sudo
         try:
             exclude_opts = ""
@@ -316,7 +325,7 @@ def compress_tar_exclude(args):
             run(cmd)
             run(f"sudo chown $USER:$USER {output_file}")
         except Exception as e2:
-            print(f"Fatal error compressing {directory}: {e2}")
+            log_message(f"Fatal error compressing {directory}: {e2}")
             raise
 
     log_time(f"Compression of {os.path.basename(output_file)}", start_time)
@@ -326,11 +335,11 @@ def compress_tar_exclude(args):
 def compress_tar(args):
     directory, output_file = args
     start_time = time.perf_counter()
-    print(f"Compressing {directory} to {output_file}")
+    log_message(f"Compressing {directory} to {output_file}")
 
     # Check if directory exists
     if not os.path.exists(directory):
-        print(f"Warning: Directory {directory} does not exist. Skipping compression.")
+        log_message(f"Warning: Directory {directory} does not exist. Skipping compression.")
         return None
 
     # Handle permission issues
@@ -340,20 +349,20 @@ def compress_tar(args):
             try:
                 compress_tar_fast(directory, output_file)
             except Exception as e:
-                print(f"Warning: Fast compression failed, falling back to Python implementation: {e}")
+                log_message(f"Warning: Fast compression failed, falling back to Python implementation: {e}")
                 compress_tar_py(directory, output_file)
         else:
             # For small files, use Python's implementation
             compress_tar_py(directory, output_file)
     except Exception as e:
-        print(f"Warning: Error compressing {directory}: {e}")
+        log_message(f"Warning: Error compressing {directory}: {e}")
         # Try with sudo
         try:
             cmd = f"sudo tar -czf {output_file} -C {os.path.dirname(directory)} {os.path.basename(directory)}"
             run(cmd)
             run(f"sudo chown $USER:$USER {output_file}")
         except Exception as e2:
-            print(f"Fatal error compressing {directory}: {e2}")
+            log_message(f"Fatal error compressing {directory}: {e2}")
             raise
 
     log_time(f"Compression of {os.path.basename(output_file)}", start_time)
@@ -388,7 +397,7 @@ def rsync_transfer(file_list, remote_folder):
         log_time("Rsync transfer", start_time)
         return True
     except Exception as e:
-        print(f"WARNING: rsync failed: {e}")
+        log_message(f"WARNING: rsync failed: {e}")
         return False
 
 
@@ -421,7 +430,7 @@ def s3_transfer(files_list, remote_folder):
         log_time("S3 transfer", start_time)
         return True
     except Exception as e:
-        print(f"WARNING: S3 upload failed: {e}")
+        log_message(f"WARNING: S3 upload failed: {e}")
         return False
 
 
@@ -457,7 +466,7 @@ def gcs_transfer(files_list, remote_folder):
         log_time("GCS transfer", start_time)
         return True
     except Exception as e:
-        print(f"WARNING: GCS upload failed: {e}")
+        log_message(f"WARNING: GCS upload failed: {e}")
         return False
 
 
@@ -472,12 +481,12 @@ def transfer_files(files_to_transfer, remote_folder, targets):
             try:
                 run(f'sudo rm -rf {dump_dir}')
             except Exception as e:
-                print(f"WARNING: Failed to remove dump directory {dump_dir}: {e}")
+                log_message(f"WARNING: Failed to remove dump directory {dump_dir}: {e}")
 
     # Filter out None values from files_to_transfer
     files_to_transfer = [f for f in files_to_transfer if f is not None]
     if not files_to_transfer:
-        print("WARNING: No files to transfer!")
+        log_message("WARNING: No files to transfer!")
         return
 
     # Generate checksums in parallel
@@ -509,11 +518,11 @@ def transfer_files(files_to_transfer, remote_folder, targets):
             try:
                 success = future.result()
                 if success:
-                    print(f"{name.upper()} transfer completed successfully")
+                    log_message(f"{name.upper()} transfer completed successfully")
                 else:
-                    print(f"{name.upper()} transfer failed")
+                    log_message(f"{name.upper()} transfer failed")
             except Exception as e:
-                print(f"{name.upper()} transfer raised an exception: {e}")
+                log_message(f"{name.upper()} transfer raised an exception: {e}")
 
     # Clean up files after transfer
     for file in files_to_transfer:
@@ -523,7 +532,7 @@ def transfer_files(files_to_transfer, remote_folder, targets):
     # Get the directory containing the backup files
     backup_dir = os.path.dirname(files_to_transfer[0]) if files_to_transfer else None
 
-    print("Cleanup complete.")
+    log_message("Cleanup complete.")
 
     return backup_dir  # Return the backup directory path for cleanup in main
 
@@ -544,7 +553,7 @@ def main():
     backup_path = os.path.join(BACKUP_DIR, folder_name)
 
     if os.path.exists(backup_path):
-        print(f"Backup already exists for today: {backup_path}")
+        log_message(f"Backup already exists for today: {backup_path}")
         return
 
     try:
@@ -554,10 +563,10 @@ def main():
         run(f"sudo chown $USER:$USER {backup_path}")
 
     # Run database dumps sequentially to avoid Docker container issues
-    print("Starting MySQL dump...")
+    log_message("Starting MySQL dump...")
     mysql_dump_dir = mysql_dump()
 
-    print("Starting MongoDB dump...")
+    log_message("Starting MongoDB dump...")
     mongodb_dump_dir = mongodb_dump()
 
     # Get tutor root and parent directory for tutor config and plugins
@@ -587,9 +596,9 @@ def main():
     # Add tutor-plugins backup if directory exists
     if os.path.exists(tutor_plugins_dir):
         compression_tasks.append((tutor_plugins_dir, tutor_plugins_tar_file))
-        print(f"Found tutor-plugins directory: {tutor_plugins_dir}")
+        log_message(f"Found tutor-plugins directory: {tutor_plugins_dir}")
     else:
-        print(f"Warning: tutor-plugins directory not found at {tutor_plugins_dir}")
+        log_message(f"Warning: tutor-plugins directory not found at {tutor_plugins_dir}")
 
     # Run compression in parallel with ThreadPoolExecutor
     files_to_transfer = []
@@ -604,7 +613,7 @@ def main():
                     files_to_transfer.append(result)
             except Exception as e:
                 task = future_to_task[future]
-                print(f"Compression task failed for {task[0]}: {e}")
+                log_message(f"Compression task failed for {task[0]}: {e}")
 
     # Handle compression tasks with excludes
     with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
@@ -616,7 +625,7 @@ def main():
                     files_to_transfer.append(result)
             except Exception as e:
                 task = future_to_task[future]
-                print(f"Compression task with excludes failed for {task[0]}: {e}")
+                log_message(f"Compression task with excludes failed for {task[0]}: {e}")
 
     # Transfer compressed files
     transfer_files(files_to_transfer, folder_name, targets)
@@ -625,14 +634,14 @@ def main():
     if os.path.exists(backup_path):
         try:
             shutil.rmtree(backup_path)
-            print(f"Removed temporary backup folder: {backup_path}")
+            log_message(f"Removed temporary backup folder: {backup_path}")
         except Exception as e:
-            print(f"Warning: Could not remove backup folder {backup_path}: {e}")
+            log_message(f"Warning: Could not remove backup folder {backup_path}: {e}")
             try:
                 run(f"sudo rm -rf {backup_path}")
-                print(f"Removed temporary backup folder with sudo: {backup_path}")
+                log_message(f"Removed temporary backup folder with sudo: {backup_path}")
             except Exception as e2:
-                print(f"Error: Failed to remove backup folder even with sudo: {e2}")
+                log_message(f"Error: Failed to remove backup folder even with sudo: {e2}")
 
     log_time("Total backup process", total_start_time)
 
