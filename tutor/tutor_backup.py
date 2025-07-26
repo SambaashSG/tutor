@@ -9,9 +9,10 @@ import multiprocessing
 import tarfile
 import hashlib
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from functools import partial
+import re
 
 # ========= LOAD ENVIRONMENT =========
 
@@ -40,6 +41,12 @@ AWS_S3_PREFIX = os.getenv("AWS_S3_PREFIX", "tutor-backup")
 
 GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
 
+# Backup retention configuration
+BACKUP_RETAIN_DAILY_DAYS = int(os.getenv("BACKUP_RETAIN_DAILY_DAYS", "2"))  # Keep last N days
+BACKUP_RETAIN_WEEKLY_INTERVAL = int(os.getenv("BACKUP_RETAIN_WEEKLY_INTERVAL", "7"))  # Weekly backup interval
+BACKUP_RETAIN_WEEKLY_COUNT = int(os.getenv("BACKUP_RETAIN_WEEKLY_COUNT", "52"))  # Keep N weekly backups (52 = 1 year)
+
+
 BACKUP_DIR = "/tmp/tutor-backup"
 
 # Number of workers for parallel operations
@@ -67,6 +74,37 @@ def log_message(message):
     print(f"[{timestamp}] {message}")
     sys.stdout.flush()
 
+
+def get_dates_to_keep():
+    """Generate list of dates to keep based on retention policy from environment variables"""
+    now = datetime.now()
+    dates_to_keep = set()
+
+    # Keep last N days (daily backups)
+    for i in range(BACKUP_RETAIN_DAILY_DAYS):
+        date = now - timedelta(days=i)
+        dates_to_keep.add(date.strftime("%Y%m%d"))
+
+    # Keep every Nth day going back (weekly backups)
+    # Calculate total days to go back based on weekly count and interval
+    total_days_back = BACKUP_RETAIN_WEEKLY_COUNT * BACKUP_RETAIN_WEEKLY_INTERVAL
+    for i in range(0, total_days_back, BACKUP_RETAIN_WEEKLY_INTERVAL):
+        date = now - timedelta(days=i)
+        dates_to_keep.add(date.strftime("%Y%m%d"))
+
+    log_message(
+        f"Retention policy: Daily={BACKUP_RETAIN_DAILY_DAYS} days, Weekly=every {BACKUP_RETAIN_WEEKLY_INTERVAL} days for {BACKUP_RETAIN_WEEKLY_COUNT} weeks")
+    log_message(f"Total dates to keep: {len(dates_to_keep)}")
+
+    return dates_to_keep
+
+
+def extract_date_from_folder_name(folder_name):
+    """Extract date from backup folder name"""
+    # Pattern: CLIENT_NAME-ENV_TYPE-tutor-backup-YYYYMMDD
+    pattern = rf"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-(\d{{8}})"
+    match = re.search(pattern, folder_name)
+    return match.group(1) if match else None
 
 
 def run(cmd, check=True):
@@ -125,6 +163,203 @@ def install_requirements():
         from google.cloud import storage
     except ImportError:
         install_python_package("google-cloud-storage")
+
+
+# ========= BACKUP RETENTION =========
+
+def cleanup_rsync_backups():
+    """Clean up old backups on rsync server"""
+    start_time = time.perf_counter()
+    try:
+        dates_to_keep = get_dates_to_keep()
+        ssh_opts = f'-i {SSH_KEY_PATH} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+
+        # List remote directories
+        result = run(f'ssh {ssh_opts} {REMOTE_SERVER} "ls -1 {REMOTE_PATH}/"', check=False)
+        if result.returncode != 0:
+            log_message("No existing backups found on rsync server or error listing directories")
+            return True
+
+        remote_folders = result.stdout.strip().split('\n') if result.stdout.strip() else []
+
+        folders_to_delete = []
+        for folder in remote_folders:
+            folder = folder.strip()
+            if not folder:
+                continue
+
+            date_str = extract_date_from_folder_name(folder)
+            if date_str and date_str not in dates_to_keep:
+                folders_to_delete.append(folder)
+
+        if folders_to_delete:
+            log_message(f"Deleting {len(folders_to_delete)} old backup folders from rsync server")
+            for folder in folders_to_delete:
+                run(f'ssh {ssh_opts} {REMOTE_SERVER} "rm -rf {REMOTE_PATH}/{folder}"')
+                log_message(f"Deleted rsync folder: {folder}")
+        else:
+            log_message("No old backup folders to delete from rsync server")
+
+        log_time("Rsync cleanup", start_time)
+        return True
+    except Exception as e:
+        log_message(f"WARNING: rsync cleanup failed: {e}")
+        return False
+
+
+def cleanup_s3_backups():
+    """Clean up old backups on S3"""
+    start_time = time.perf_counter()
+    try:
+        import boto3
+        dates_to_keep = get_dates_to_keep()
+
+        session = boto3.session.Session(
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        s3 = session.client('s3')
+
+        # List objects with the prefix to find folders to delete
+        paginator = s3.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix=AWS_S3_PREFIX + '/', Delimiter='/')
+
+        folders_to_delete = set()
+
+        # Get all folder prefixes (CommonPrefixes)
+        for page in pages:
+            if 'CommonPrefixes' in page:
+                for prefix_info in page['CommonPrefixes']:
+                    prefix = prefix_info['Prefix']
+                    # Extract folder name from prefix (format: prefix/folder_name/)
+                    parts = prefix.rstrip('/').split('/')
+                    if len(parts) >= 2:
+                        folder_name = parts[1]  # Second part is the folder name
+                        date_str = extract_date_from_folder_name(folder_name)
+                        if date_str and date_str not in dates_to_keep:
+                            folders_to_delete.add(folder_name)
+
+        if folders_to_delete:
+            log_message(f"Deleting {len(folders_to_delete)} old backup folders from S3")
+
+            for folder_name in folders_to_delete:
+                # List all objects in this folder
+                folder_prefix = f"{AWS_S3_PREFIX}/{folder_name}/"
+                folder_paginator = s3.get_paginator('list_objects_v2')
+                folder_pages = folder_paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix=folder_prefix)
+
+                objects_to_delete = []
+                for page in folder_pages:
+                    if 'Contents' in page:
+                        for obj in page['Contents']:
+                            objects_to_delete.append({'Key': obj['Key']})
+
+                if objects_to_delete:
+                    # Delete in batches of 1000 (S3 limit)
+                    for i in range(0, len(objects_to_delete), 1000):
+                        batch = objects_to_delete[i:i + 1000]
+                        s3.delete_objects(
+                            Bucket=AWS_BUCKET_NAME,
+                            Delete={'Objects': batch}
+                        )
+                    log_message(f"Deleted S3 folder: {folder_name} ({len(objects_to_delete)} objects)")
+                else:
+                    log_message(f"S3 folder {folder_name} was already empty")
+        else:
+            log_message("No old backup folders to delete from S3")
+
+        log_time("S3 cleanup", start_time)
+        return True
+    except Exception as e:
+        log_message(f"WARNING: S3 cleanup failed: {e}")
+        return False
+
+
+def cleanup_gcs_backups():
+    """Clean up old backups on Google Cloud Storage"""
+    start_time = time.perf_counter()
+    try:
+        from google.cloud import storage
+        dates_to_keep = get_dates_to_keep()
+
+        key_path = "/tmp/gcp_service_account.json"
+        with open(key_path, "w") as f:
+            json.dump(json.loads(GCP_SERVICE_ACCOUNT_JSON), f)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(AWS_BUCKET_NAME)
+
+        # Get all blobs with the prefix to identify folders to delete
+        blobs = bucket.list_blobs(prefix=AWS_S3_PREFIX + '/')
+
+        folders_to_delete = set()
+        blobs_by_folder = {}
+
+        for blob in blobs:
+            # Extract folder name from blob name (format: prefix/folder_name/file)
+            parts = blob.name.split('/')
+            if len(parts) >= 2:
+                folder_name = parts[1]  # Second part is the folder name
+                date_str = extract_date_from_folder_name(folder_name)
+                if date_str and date_str not in dates_to_keep:
+                    folders_to_delete.add(folder_name)
+                    if folder_name not in blobs_by_folder:
+                        blobs_by_folder[folder_name] = []
+                    blobs_by_folder[folder_name].append(blob)
+
+        if folders_to_delete:
+            log_message(f"Deleting {len(folders_to_delete)} old backup folders from GCS")
+
+            for folder_name in folders_to_delete:
+                blobs_to_delete = blobs_by_folder.get(folder_name, [])
+                if blobs_to_delete:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                        def delete_blob(blob):
+                            blob.delete()
+                            return blob.name
+
+                        list(executor.map(delete_blob, blobs_to_delete))
+                    log_message(f"Deleted GCS folder: {folder_name} ({len(blobs_to_delete)} blobs)")
+                else:
+                    log_message(f"GCS folder {folder_name} was already empty")
+        else:
+            log_message("No old backup folders to delete from GCS")
+
+        os.remove(key_path)
+        log_time("GCS cleanup", start_time)
+        return True
+    except Exception as e:
+        log_message(f"WARNING: GCS cleanup failed: {e}")
+        return False
+
+
+def cleanup_old_backups(targets):
+    """Clean up old backups from all configured targets"""
+    log_message("Starting cleanup of old backups...")
+
+    cleanup_tasks = []
+    if "rsync" in targets:
+        cleanup_tasks.append(("rsync", cleanup_rsync_backups))
+    if "s3" in targets:
+        cleanup_tasks.append(("s3", cleanup_s3_backups))
+    if "gcs" in targets:
+        cleanup_tasks.append(("gcs", cleanup_gcs_backups))
+
+    # Execute all cleanup tasks in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(cleanup_tasks)) as executor:
+        futures = {executor.submit(func): name for name, func in cleanup_tasks}
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                success = future.result()
+                if success:
+                    log_message(f"{name.upper()} cleanup completed successfully")
+                else:
+                    log_message(f"{name.upper()} cleanup failed")
+            except Exception as e:
+                log_message(f"{name.upper()} cleanup raised an exception: {e}")
 
 
 # ========= BACKUP FUNCTIONS =========
@@ -547,6 +782,9 @@ def main():
     install_requirements()
 
     targets = ["rsync", "s3", "gcs"]
+
+    # Clean up old backups first before creating new ones
+    cleanup_old_backups(targets)
 
     today_str = datetime.now().strftime("%Y%m%d")
     folder_name = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{today_str}"
