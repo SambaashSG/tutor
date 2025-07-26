@@ -639,40 +639,61 @@ def restore_all_parallel(restore_tasks):
 
 def restore_mysql(mysql_dump_path):
     """Restore MySQL database from a dump file using the tutor local exec command."""
-    start_time = time.perf_counter()
-
-    username = get_tutor_value("MYSQL_ROOT_USERNAME")
-    password = get_tutor_value("MYSQL_ROOT_PASSWORD")
-
     # Path to the actual SQL dump file within the extracted directory
     sql_file = os.path.join(mysql_dump_path, "all-databases.sql")
 
     if not os.path.exists(sql_file):
         log_message(f"Error: MySQL dump file {sql_file} not found.")
+        # List contents of extraction directory for debugging
+        if os.path.exists(mysql_dump_path):
+            contents = os.listdir(mysql_dump_path)
+            log_message(f"Contents of {mysql_dump_path}: {contents}")
         return False
 
     try:
+        username = get_tutor_value("MYSQL_ROOT_USERNAME")
+        password = get_tutor_value("MYSQL_ROOT_PASSWORD")
+
         # Move the SQL file to a location accessible by the MySQL container
         tutor_root = get_tutor_root()
         mysql_data_dir = os.path.join(tutor_root, "data/mysql")
         target_sql_file = os.path.join(mysql_data_dir, "all-databases.sql")
 
-        # Make sure the target directory exists
-        os.makedirs(os.path.dirname(target_sql_file), exist_ok=True)
+        log_message(f"Ensuring MySQL data directory exists: {mysql_data_dir}")
+        try:
+            os.makedirs(os.path.dirname(target_sql_file), exist_ok=True)
+        except PermissionError:
+            run(f"sudo mkdir -p {os.path.dirname(target_sql_file)}", real_time_output=False)
+            run(f"sudo chown -R $USER:$USER {mysql_data_dir}", real_time_output=False)
 
         log_message(f"Moving SQL file from {sql_file} to {target_sql_file}")
-        shutil.move(sql_file, target_sql_file)
+        try:
+            shutil.move(sql_file, target_sql_file)
+        except PermissionError:
+            # Use sudo to move and then change ownership
+            log_message("Using sudo for file operations due to permission restrictions...")
+            run(f"sudo mv {sql_file} {target_sql_file}", real_time_output=False)
+            run(f"sudo chown $USER:$USER {target_sql_file}", real_time_output=False)
 
-        # Use the tutor local exec command as you specified
+        # Use the tutor local exec command
         log_message("Executing MySQL restore command...")
-        cmd = f'tutor local exec -e USERNAME="{username}" -e PASSWORD="{password}" mysql sh -c \'mysql --user=$USERNAME --password=$PASSWORD < /var/lib/mysql/all-databases.sql\''
+        # Get the MySQL container name
+        mysql_container_cmd = "docker ps --filter 'name=mysql' --format '{{.Names}}' | head -1"
+        result = run(mysql_container_cmd, real_time_output=False)
+        mysql_container = result.stdout.strip() if result.stdout else "tutor_local_mysql_1"
 
-        run(cmd, real_time_output=True)
+        log_message(f"Using MySQL container: {mysql_container}")
+
+        # Use docker exec with non-interactive mode and pipe the file
+        restore_cmd = f'docker exec -i {mysql_container} mysql --user={username} --password={password} < {target_sql_file}'
+
+        log_message("Starting MySQL restore (this may take a while for large databases)...")
+        run(restore_cmd, real_time_output=True)
 
         # Clean up
         log_message("Cleaning up temporary SQL file...")
         if os.path.exists(target_sql_file):
-            os.remove(target_sql_file)
+            run(f"sudo rm -f {target_sql_file}", real_time_output=False)
 
         return True
     except Exception as e:
@@ -684,13 +705,15 @@ def restore_mysql(mysql_dump_path):
 
 def restore_mongodb(mongodb_dump_path):
     """Restore MongoDB from a dump directory using direct docker exec command."""
-    start_time = time.perf_counter()
-
     # The expected path to the MongoDB dump directory
     dump_dir = os.path.join(mongodb_dump_path, "dump.mongodb")
 
     if not os.path.exists(dump_dir):
         log_message(f"Error: MongoDB dump directory {dump_dir} not found.")
+        # List contents of extraction directory for debugging
+        if os.path.exists(mongodb_dump_path):
+            contents = os.listdir(mongodb_dump_path)
+            log_message(f"Contents of {mongodb_dump_path}: {contents}")
         return False
 
     try:
@@ -699,22 +722,42 @@ def restore_mongodb(mongodb_dump_path):
         mongodb_data_dir = os.path.join(tutor_root, "data/mongodb")
         target_dump_dir = os.path.join(mongodb_data_dir, "dump.mongodb")
 
+        # Ensure MongoDB data directory exists with proper permissions
+        log_message(f"Ensuring MongoDB data directory exists: {mongodb_data_dir}")
+        try:
+            os.makedirs(mongodb_data_dir, exist_ok=True)
+        except PermissionError:
+            run(f"sudo mkdir -p {mongodb_data_dir}", real_time_output=False)
+            run(f"sudo chown -R $USER:$USER {mongodb_data_dir}", real_time_output=False)
+
         # Remove existing dump directory if it exists
         if os.path.exists(target_dump_dir):
+            log_message(f"Removing existing dump directory: {target_dump_dir}")
             try:
                 shutil.rmtree(target_dump_dir)
-            except Exception:
+            except PermissionError:
                 run(f"sudo rm -rf {target_dump_dir}", real_time_output=False)
 
         log_message(f"Moving MongoDB dump from {dump_dir} to {target_dump_dir}")
-        shutil.move(dump_dir, target_dump_dir)
+        try:
+            shutil.move(dump_dir, target_dump_dir)
+        except PermissionError:
+            # Use sudo for directory operations
+            log_message("Using sudo for directory operations due to permission restrictions...")
+            run(f"sudo mv {dump_dir} {target_dump_dir}", real_time_output=False)
+            run(f"sudo chown -R $USER:$USER {target_dump_dir}", real_time_output=False)
+
+        mongodb_container_cmd = "docker ps --filter 'name=mongodb' --format '{{.Names}}' | head -1"
+        result = run(mongodb_container_cmd, real_time_output=False)
+        mongodb_container = result.stdout.strip() if result.stdout else "tutor_local_mongodb_1"
+
+        log_message(f"Using MongoDB container: {mongodb_container}")
 
         # First, drop all existing databases
         log_message("Dropping all existing MongoDB databases...")
 
         # Get list of databases and drop them (except admin, local, and config)
-        list_dbs_cmd = 'docker exec tutor_local_mongodb_1 mongo --eval "db.adminCommand(\'listDatabases\').databases.forEach(function(d) { if (d.name !== \'admin\' && d.name !== \'local\' && d.name !== \'config\') { print(d.name); } })"'
-
+        list_dbs_cmd = f'docker exec {mongodb_container} mongo --eval "db.adminCommand(\'listDatabases\').databases.forEach(function(d) {{ if (d.name !== \'admin\' && d.name !== \'local\' && d.name !== \'config\') {{ print(d.name); }} }})"'
         try:
             result = run(list_dbs_cmd, real_time_output=False)
             if result.stdout:
@@ -724,7 +767,7 @@ def restore_mongodb(mongodb_dump_path):
                 for db_name in databases:
                     if db_name:  # Make sure it's not empty
                         log_message(f"Dropping database: {db_name}")
-                        drop_cmd = f'docker exec tutor_local_mongodb_1 mongo {db_name} --eval "db.dropDatabase()"'
+                        drop_cmd = f'docker exec {mongodb_container} mongo {db_name} --eval "db.dropDatabase()"'
                         run(drop_cmd, real_time_output=True)
         except Exception as e:
             log_message(f"Warning: Could not drop existing databases: {e}")
@@ -732,9 +775,7 @@ def restore_mongodb(mongodb_dump_path):
 
         # Use the direct docker exec command for MongoDB restore
         log_message("Executing MongoDB restore command...")
-
-        # Use the command you specified but with real-time monitoring
-        restore_cmd = f'docker exec tutor_local_mongodb_1 mongorestore --drop /data/db/dump.mongodb'
+        restore_cmd = f'docker exec {mongodb_container} mongorestore --drop /data/db/dump.mongodb'
 
         log_message("Starting MongoDB restore (this may take a while for large databases)...")
         run(restore_cmd, real_time_output=True)
@@ -754,11 +795,8 @@ def restore_mongodb(mongodb_dump_path):
         traceback.print_exc()
         return False
 
-
 def restore_openedx_media(media_dir):
     """Restore OpenedX media files."""
-    start_time = time.perf_counter()
-
     tutor_root = get_tutor_root()
     target_dir = os.path.join(tutor_root, "data/openedx-media")
 
@@ -767,9 +805,6 @@ def restore_openedx_media(media_dir):
         return False
 
     try:
-        # Stop the Tutor services before restoring media
-        log_message("Stopping Tutor services...")
-        run("tutor local stop")
 
         # Remove existing media directory
         if os.path.exists(target_dir):
@@ -782,37 +817,76 @@ def restore_openedx_media(media_dir):
         # Create the target directory
         os.makedirs(target_dir, exist_ok=True)
 
-        # Move the media files
+        # Move the media files - Fix the mv command
         source_dir = media_dir
         if os.path.isdir(os.path.join(media_dir, "openedx-media")):
             # If the extract created a nested directory structure
             source_dir = os.path.join(media_dir, "openedx-media")
 
         log_message(f"Moving media files from {source_dir} to {target_dir}")
-        # Use mv command for better handling of large directories
-        run(f"mv {source_dir}/* {target_dir}/", real_time_output=False)
+
+        # Check if source has files before moving
+        source_files = os.listdir(source_dir)
+        if source_files:
+            # Move each file/directory individually to avoid shell expansion issues
+            for item in source_files:
+                source_item = os.path.join(source_dir, item)
+                target_item = os.path.join(target_dir, item)
+                log_message(f"Moving {item}...")
+                shutil.move(source_item, target_item)
+        else:
+            log_message("Warning: No files found in media source directory")
 
         # Fix permissions
         log_message("Fixing permissions...")
         run(f"sudo chown -R $USER:$USER {target_dir}", real_time_output=False)
-
-        # Start Tutor services
-        log_message("Starting Tutor services...")
-        run("tutor local start")
 
         return True
     except Exception as e:
         log_message(f"Error restoring OpenedX media: {e}")
         import traceback
         traceback.print_exc()
-        # Make sure to restart Tutor services even if there was an error
-        try:
-            log_message("Attempting to restart Tutor services after error...")
-            run("tutor local start")
-        except:
-            pass
         return False
 
+
+def ensure_tutor_running():
+    """Check if Tutor is running, start it if not."""
+    log_message("Checking Tutor status...")
+
+    try:
+        # Check if Tutor services are running
+        result = run("tutor local status", real_time_output=False, check=False)
+
+        if result.returncode != 0:
+            log_message("Tutor services are not running. Starting Tutor in detached mode...")
+            run("tutor local start -d", real_time_output=False)
+            log_message("Tutor services started successfully")
+            return True
+        else:
+            # Parse the output to check if all services are running
+            output = result.stdout.strip()
+            log_message(f"Tutor status: {output}")
+
+            # Check if any service is not running (contains "Exit" or "Down")
+            if "Exit" in output or "Down" in output or not output:
+                log_message("Some Tutor services are not running properly. Starting Tutor in detached mode...")
+                run("tutor local start -d", real_time_output=False)
+                log_message("Tutor services started successfully")
+                return True
+            else:
+                log_message("Tutor services are already running")
+                return True
+
+    except Exception as e:
+        log_message(f"Error checking Tutor status: {e}")
+        log_message("Attempting to start Tutor services in detached mode...")
+        try:
+            run("tutor local start -d", real_time_output=False)
+            log_message("Tutor services started successfully")
+            return True
+        except Exception as e2:
+            log_message(f"Failed to start Tutor services: {e2}")
+            return False
 
 # ========= MAIN =========
 
@@ -889,6 +963,8 @@ def main():
         if not extract_files_parallel(extraction_tasks):
             log_message("Some extractions failed. Check the logs above.")
             sys.exit(1)
+
+        ensure_tutor_running()
 
         # Perform restore operations in parallel
         log_message("\n=== Starting parallel restore process ===\n")
