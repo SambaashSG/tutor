@@ -44,29 +44,65 @@ RESTORE_DIR = "/tmp/tutor-restore"
 
 def log_time(message, start_time):
     elapsed = time.perf_counter() - start_time
-    print(f"[{message}] completed in {elapsed:.2f} seconds.")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message} completed in {elapsed:.2f} seconds.")
+    sys.stdout.flush()
 
 
-def run(cmd, check=True):
-    """Run a shell command with better error handling"""
-    print(f"Running: {cmd}")
+def log_message(message):
+    """Log a message with timestamp and immediate flush"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+    sys.stdout.flush()
+
+
+def run(cmd, check=True, real_time_output=True):
+    """Run a shell command with better error handling and real-time output"""
+    log_message(f"Running: {cmd}")
+
     try:
-        process = subprocess.run(
-            cmd,
-            shell=True,
-            check=check,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True  # Get string output instead of bytes
-        )
-        if process.stdout:
-            print(f"STDOUT: {process.stdout}")
-        return process
+        if real_time_output:
+            # For real-time output, use Popen
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            # Print output in real-time
+            for line in iter(process.stdout.readline, ''):
+                print(line.rstrip())
+                sys.stdout.flush()
+
+            process.wait()
+
+            if check and process.returncode != 0:
+                raise subprocess.CalledProcessError(process.returncode, cmd)
+
+            return process
+        else:
+            # For non-real-time, use the original method
+            process = subprocess.run(
+                cmd,
+                shell=True,
+                check=check,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if process.stdout:
+                print(f"STDOUT: {process.stdout}")
+            return process
+
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Command failed with status {e.returncode}")
-        if e.stdout:
+        log_message(f"ERROR: Command failed with status {e.returncode}")
+        if hasattr(e, 'stdout') and e.stdout:
             print(f"STDOUT: {e.stdout}")
-        if e.stderr:
+        if hasattr(e, 'stderr') and e.stderr:
             print(f"STDERR: {e.stderr}")
         if check:
             raise
@@ -92,38 +128,38 @@ def install_requirements():
         try:
             run(f"sudo apt-get update && sudo apt-get install -y {' '.join(essential_pkgs)}")
         except subprocess.CalledProcessError as e:
-            print(f"Warning: Failed to install system packages: {e}")
-            print("Some functionality may be limited.")
+            log_message(f"Warning: Failed to install system packages: {e}")
+            log_message("Some functionality may be limited.")
 
     # Install AWS CLI via snap if not available
     if not is_installed("aws"):
         try:
-            print("AWS CLI not found, attempting to install via snap...")
+            log_message("AWS CLI not found, attempting to install via snap...")
             run("sudo snap install aws-cli --classic")
         except subprocess.CalledProcessError as e:
-            print(f"Warning: Could not install AWS CLI via snap: {e}")
-            print("S3 backup functionality will not be available.")
+            log_message(f"Warning: Could not install AWS CLI via snap: {e}")
+            log_message("S3 backup functionality will not be available.")
 
     # Install Python packages
     try:
         import boto3
     except ImportError:
         try:
-            print("Installing boto3...")
+            log_message("Installing boto3...")
             install_python_package("boto3")
         except Exception as e:
-            print(f"Warning: Could not install boto3: {e}")
-            print("S3 backup functionality will not be available.")
+            log_message(f"Warning: Could not install boto3: {e}")
+            log_message("S3 backup functionality will not be available.")
 
     try:
         from google.cloud import storage
     except ImportError:
         try:
-            print("Installing google-cloud-storage...")
+            log_message("Installing google-cloud-storage...")
             install_python_package("google-cloud-storage")
         except Exception as e:
-            print(f"Warning: Could not install google-cloud-storage: {e}")
-            print("GCS backup functionality will not be available.")
+            log_message(f"Warning: Could not install google-cloud-storage: {e}")
+            log_message("GCS backup functionality will not be available.")
 
 
 def ensure_ssh_key():
@@ -146,7 +182,7 @@ def get_tutor_root():
 def verify_checksum(file_path, checksum_file):
     """Verify the checksum of a file against its checksum file."""
     if not os.path.exists(checksum_file):
-        print(f"Warning: Checksum file {checksum_file} not found. Skipping verification.")
+        log_message(f"Warning: Checksum file {checksum_file} not found. Skipping verification.")
         return True
 
     sha256_hash = hashlib.sha256()
@@ -161,21 +197,21 @@ def verify_checksum(file_path, checksum_file):
         stored_hash = checksum_line.split()[0]
 
     if calculated_hash == stored_hash:
-        print(f"Checksum verified for {os.path.basename(file_path)}")
+        log_message(f"Checksum verified for {os.path.basename(file_path)}")
         return True
     else:
-        print(f"Warning: Checksum mismatch for {os.path.basename(file_path)}")
-        print(f"Expected: {stored_hash}")
-        print(f"Got: {calculated_hash}")
+        log_message(f"Warning: Checksum mismatch for {os.path.basename(file_path)}")
+        log_message(f"Expected: {stored_hash}")
+        log_message(f"Got: {calculated_hash}")
         return False
 
 
 # ========= BACKUP RETRIEVAL =========
 
 def check_local_backup(backup_date=None, folder_name=None):
-    """Check if a backup exists locally in the same path where rsync stores backups."""
+    """Check if a backup exists locally and return the path directly (no copying)."""
     if not REMOTE_PATH:
-        print("REMOTE_PATH not set. Skipping local backup check.")
+        log_message("REMOTE_PATH not set. Skipping local backup check.")
         return None
 
     start_time = time.perf_counter()
@@ -193,13 +229,13 @@ def check_local_backup(backup_date=None, folder_name=None):
 
         backup_folder = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{date_str}"
 
-    print(f"Checking for local backup in folder: {backup_folder}")
+    log_message(f"Checking for local backup in folder: {backup_folder}")
 
     # The complete path where backups are stored by the rsync in the backup script
     local_backup_path = os.path.join(REMOTE_PATH, backup_folder)
 
     if not os.path.exists(local_backup_path):
-        print(f"Local backup not found at: {local_backup_path}")
+        log_message(f"Local backup not found at: {local_backup_path}")
         return None
 
     # Check for required backup files
@@ -212,41 +248,25 @@ def check_local_backup(backup_date=None, folder_name=None):
             missing_files.append(file)
 
     if missing_files:
-        print(f"Required files not found in local backup: {', '.join(missing_files)}")
+        log_message(f"Required files not found in local backup: {', '.join(missing_files)}")
         return None
 
-    # Create restore directory
-    restore_path = os.path.join(RESTORE_DIR, backup_folder)
-    if not os.path.exists(restore_path):
-        os.makedirs(restore_path, exist_ok=True)
-
-    # Copy backup files to restore directory
-    for file in required_files:
-        src_file = os.path.join(local_backup_path, file)
-        dst_file = os.path.join(restore_path, file)
-        print(f"Copying {src_file} to {dst_file}")
-        shutil.copy2(src_file, dst_file)
-
-        # Copy checksum file if it exists
-        checksum_file = f"{src_file}.sha256"
-        if os.path.exists(checksum_file):
-            shutil.copy2(checksum_file, f"{dst_file}.sha256")
-
-    log_time("Local backup copy", start_time)
-    return restore_path
+    log_time("Local backup check", start_time)
+    log_message(f"Local backup found and verified at: {local_backup_path}")
+    return local_backup_path
 
 
 def download_s3_backup(backup_date=None, folder_name=None):
     """Download backup from AWS S3."""
     if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY or not AWS_BUCKET_NAME:
-        print("AWS credentials or bucket not set. Skipping S3 check.")
+        log_message("AWS credentials or bucket not set. Skipping S3 check.")
         return None
 
     # Check if boto3 is available
     try:
         import boto3
     except ImportError:
-        print("boto3 not available. Skipping S3 check.")
+        log_message("boto3 not available. Skipping S3 check.")
         return None
 
     start_time = time.perf_counter()
@@ -272,7 +292,7 @@ def download_s3_backup(backup_date=None, folder_name=None):
 
             remote_folder = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{date_str}"
 
-        print(f"Checking for S3 backup in folder: {remote_folder}")
+        log_message(f"Checking for S3 backup in folder: {remote_folder}")
 
         # Create local restore directory
         restore_path = os.path.join(RESTORE_DIR, remote_folder)
@@ -284,7 +304,7 @@ def download_s3_backup(backup_date=None, folder_name=None):
         response = s3.list_objects_v2(Bucket=AWS_BUCKET_NAME, Prefix=prefix)
 
         if 'Contents' not in response:
-            print(f"S3 backup not found: {remote_folder}")
+            log_message(f"S3 backup not found: {remote_folder}")
             return None
 
         # Check for required backup files
@@ -299,7 +319,7 @@ def download_s3_backup(backup_date=None, folder_name=None):
                 found_files.add(file_name)
                 # Download file
                 local_file = os.path.join(restore_path, file_name)
-                print(f"Downloading {file_key} to {local_file}")
+                log_message(f"Downloading {file_key} to {local_file}")
                 s3.download_file(AWS_BUCKET_NAME, file_key, local_file)
 
                 # Download checksum file if it exists
@@ -308,33 +328,33 @@ def download_s3_backup(backup_date=None, folder_name=None):
                     s3.head_object(Bucket=AWS_BUCKET_NAME, Key=checksum_key)
                     s3.download_file(AWS_BUCKET_NAME, checksum_key, f"{local_file}.sha256")
                 except:
-                    print(f"Checksum file {checksum_key} not found")
+                    log_message(f"Checksum file {checksum_key} not found")
 
         # Check if all required files were found
         if not all(file in found_files for file in required_files):
             missing = set(required_files) - found_files
-            print(f"Some required files were not found in S3 backup: {missing}")
+            log_message(f"Some required files were not found in S3 backup: {missing}")
             return None
 
         log_time("S3 backup download", start_time)
         return restore_path
 
     except Exception as e:
-        print(f"Error downloading S3 backup: {e}")
+        log_message(f"Error downloading S3 backup: {e}")
         return None
 
 
 def download_gcs_backup(backup_date=None, folder_name=None):
     """Download backup from Google Cloud Storage."""
     if not GCP_SERVICE_ACCOUNT_JSON or not AWS_BUCKET_NAME:
-        print("GCP credentials or bucket not set. Skipping GCS check.")
+        log_message("GCP credentials or bucket not set. Skipping GCS check.")
         return None
 
     # Check if google-cloud-storage is available
     try:
         from google.cloud import storage
     except ImportError:
-        print("google-cloud-storage not available. Skipping GCS check.")
+        log_message("google-cloud-storage not available. Skipping GCS check.")
         return None
 
     start_time = time.perf_counter()
@@ -361,7 +381,7 @@ def download_gcs_backup(backup_date=None, folder_name=None):
 
             remote_folder = f"{CLIENT_NAME}-{ENV_TYPE}-tutor-backup-{date_str}"
 
-        print(f"Checking for GCS backup in folder: {remote_folder}")
+        log_message(f"Checking for GCS backup in folder: {remote_folder}")
 
         # Create local restore directory
         restore_path = os.path.join(RESTORE_DIR, remote_folder)
@@ -383,7 +403,7 @@ def download_gcs_backup(backup_date=None, folder_name=None):
                 found_files.add(file_name)
                 # Download file
                 local_file = os.path.join(restore_path, file_name)
-                print(f"Downloading {blob.name} to {local_file}")
+                log_message(f"Downloading {blob.name} to {local_file}")
                 blob.download_to_filename(local_file)
 
                 # Download checksum file if it exists
@@ -392,12 +412,12 @@ def download_gcs_backup(backup_date=None, folder_name=None):
                 if checksum_blob.exists():
                     checksum_blob.download_to_filename(f"{local_file}.sha256")
                 else:
-                    print(f"Checksum file {checksum_blob_name} not found")
+                    log_message(f"Checksum file {checksum_blob_name} not found")
 
         # Check if all required files were found
         if not all(file in found_files for file in required_files):
             missing = set(required_files) - found_files
-            print(f"Some required files were not found in GCS backup: {missing}")
+            log_message(f"Some required files were not found in GCS backup: {missing}")
             return None
 
         # Clean up service account file
@@ -407,7 +427,7 @@ def download_gcs_backup(backup_date=None, folder_name=None):
         return restore_path
 
     except Exception as e:
-        print(f"Error downloading GCS backup: {e}")
+        log_message(f"Error downloading GCS backup: {e}")
         return None
 
 
@@ -416,12 +436,12 @@ def download_gcs_backup(backup_date=None, folder_name=None):
 def extract_tar(tar_file, extract_to):
     """Extract a tar file to the specified directory."""
     start_time = time.perf_counter()
-    print(f"Extracting {tar_file} to {extract_to}")
+    log_message(f"Extracting {tar_file} to {extract_to}")
 
     os.makedirs(extract_to, exist_ok=True)
 
     if not os.path.exists(tar_file):
-        print(f"Error: Tar file {tar_file} does not exist.")
+        log_message(f"Error: Tar file {tar_file} does not exist.")
         return False
 
     try:
@@ -430,7 +450,7 @@ def extract_tar(tar_file, extract_to):
         log_time(f"Extraction of {os.path.basename(tar_file)}", start_time)
         return True
     except Exception as e:
-        print(f"Error extracting {tar_file}: {e}")
+        log_message(f"Error extracting {tar_file}: {e}")
         # Try with sudo
         try:
             cmd = f"sudo tar -xzf {tar_file} -C {extract_to}"
@@ -439,13 +459,14 @@ def extract_tar(tar_file, extract_to):
             log_time(f"Extraction of {os.path.basename(tar_file)} with sudo", start_time)
             return True
         except Exception as e2:
-            print(f"Fatal error extracting {tar_file} even with sudo: {e2}")
+            log_message(f"Fatal error extracting {tar_file} even with sudo: {e2}")
             return False
 
 
 def restore_mysql(mysql_dump_path):
-    """Restore MySQL database from a dump file."""
+    """Restore MySQL database from a dump file using the tutor local exec command."""
     start_time = time.perf_counter()
+    log_message("Starting MySQL restore process...")
 
     username = get_tutor_value("MYSQL_ROOT_USERNAME")
     password = get_tutor_value("MYSQL_ROOT_PASSWORD")
@@ -454,7 +475,7 @@ def restore_mysql(mysql_dump_path):
     sql_file = os.path.join(mysql_dump_path, "all-databases.sql")
 
     if not os.path.exists(sql_file):
-        print(f"Error: MySQL dump file {sql_file} not found.")
+        log_message(f"Error: MySQL dump file {sql_file} not found.")
         return False
 
     try:
@@ -466,35 +487,39 @@ def restore_mysql(mysql_dump_path):
         # Make sure the target directory exists
         os.makedirs(os.path.dirname(target_sql_file), exist_ok=True)
 
-        # Copy the SQL file
+        log_message(f"Copying SQL file from {sql_file} to {target_sql_file}")
         shutil.copy2(sql_file, target_sql_file)
 
-        # Use docker-compose directly with -T flag to avoid TTY issues
-        compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
-        project_name = "tutor_local"
+        # Use the tutor local exec command as you specified
+        log_message("Executing MySQL restore command...")
+        cmd = f'tutor local exec -e USERNAME="{username}" -e PASSWORD="{password}" mysql sh -c \'mysql --user=$USERNAME --password=$PASSWORD < /var/lib/mysql/all-databases.sql\''
 
-        cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T -e USERNAME={username} -e PASSWORD={password} mysql sh -c \"mysql --user=\\$USERNAME --password=\\$PASSWORD < /var/lib/mysql/all-databases.sql\""
-        run(cmd)
+        run(cmd, real_time_output=True)
 
         # Clean up
+        log_message("Cleaning up temporary SQL file...")
         os.remove(target_sql_file)
 
         log_time("MySQL restore", start_time)
+        log_message("MySQL restore completed successfully")
         return True
     except Exception as e:
-        print(f"Error restoring MySQL: {e}")
+        log_message(f"Error restoring MySQL: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 
 def restore_mongodb(mongodb_dump_path):
-    """Restore MongoDB from a dump directory."""
+    """Restore MongoDB from a dump directory using direct docker exec command."""
     start_time = time.perf_counter()
+    log_message("Starting MongoDB restore process...")
 
     # The expected path to the MongoDB dump directory
     dump_dir = os.path.join(mongodb_dump_path, "dump.mongodb")
 
     if not os.path.exists(dump_dir):
-        print(f"Error: MongoDB dump directory {dump_dir} not found.")
+        log_message(f"Error: MongoDB dump directory {dump_dir} not found.")
         return False
 
     try:
@@ -510,47 +535,79 @@ def restore_mongodb(mongodb_dump_path):
             except Exception:
                 run(f"sudo rm -rf {target_dump_dir}")
 
-        # Copy the dump directory
+        log_message(f"Copying MongoDB dump from {dump_dir} to {target_dump_dir}")
         shutil.copytree(dump_dir, target_dump_dir)
 
-        # Use docker-compose directly with -T flag to avoid TTY issues
-        compose_files = f"-f {tutor_root}/env/local/docker-compose.yml -f {tutor_root}/env/local/docker-compose.prod.yml -f {tutor_root}/env/local/docker-compose.tmp.yml"
-        project_name = "tutor_local"
+        # First, drop all existing databases
+        log_message("Dropping all existing MongoDB databases...")
 
-        cmd = f"docker-compose {compose_files} --project-name {project_name} exec -T mongodb mongorestore --drop /data/db/dump.mongodb"
-        run(cmd)
+        # Get list of databases and drop them (except admin, local, and config)
+        list_dbs_cmd = 'docker exec tutor_local_mongodb_1 mongo --eval "db.adminCommand(\'listDatabases\').databases.forEach(function(d) { if (d.name !== \'admin\' && d.name !== \'local\' && d.name !== \'config\') { print(d.name); } })"'
+
+        try:
+            result = run(list_dbs_cmd, real_time_output=False)
+            if result.stdout:
+                databases = [db.strip() for db in result.stdout.strip().split('\n') if
+                             db.strip() and not db.startswith('MongoDB')]
+
+                for db_name in databases:
+                    if db_name:  # Make sure it's not empty
+                        log_message(f"Dropping database: {db_name}")
+                        drop_cmd = f'docker exec tutor_local_mongodb_1 mongo {db_name} --eval "db.dropDatabase()"'
+                        run(drop_cmd, real_time_output=True)
+        except Exception as e:
+            log_message(f"Warning: Could not drop existing databases: {e}")
+            log_message("Continuing with restore...")
+
+        # Use the direct docker exec command for MongoDB restore
+        log_message("Executing MongoDB restore command...")
+
+        # Create a log file for the restore process
+        restore_log = "/tmp/mongorestore.log"
+
+        # Use the command you specified but with real-time monitoring
+        restore_cmd = f'docker exec tutor_local_mongodb_1 mongorestore --drop /data/db/dump.mongodb'
+
+        log_message("Starting MongoDB restore (this may take a while for large databases)...")
+        run(restore_cmd, real_time_output=True)
 
         # Clean up
+        log_message("Cleaning up temporary dump directory...")
         try:
             shutil.rmtree(target_dump_dir)
         except Exception:
             run(f"sudo rm -rf {target_dump_dir}")
 
         log_time("MongoDB restore", start_time)
+        log_message("MongoDB restore completed successfully")
         return True
-    except Exception as e:
-        print(f"Error restoring MongoDB: {e}")
-        return False
 
+    except Exception as e:
+        log_message(f"Error restoring MongoDB: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def restore_openedx_media(media_dir):
     """Restore OpenedX media files."""
     start_time = time.perf_counter()
+    log_message("Starting OpenedX media restore process...")
 
     tutor_root = get_tutor_root()
     target_dir = os.path.join(tutor_root, "data/openedx-media")
 
     if not os.path.exists(media_dir):
-        print(f"Error: OpenedX media directory {media_dir} not found.")
+        log_message(f"Error: OpenedX media directory {media_dir} not found.")
         return False
 
     try:
         # Stop the Tutor services before restoring media
+        log_message("Stopping Tutor services...")
         run("tutor local stop")
 
         # Remove existing media directory
         if os.path.exists(target_dir):
-            print(f"Removing existing media directory: {target_dir}")
+            log_message(f"Removing existing media directory: {target_dir}")
             try:
                 shutil.rmtree(target_dir)
             except Exception:
@@ -565,21 +622,28 @@ def restore_openedx_media(media_dir):
             # If the extract created a nested directory structure
             source_dir = os.path.join(media_dir, "openedx-media")
 
+        log_message(f"Copying media files from {source_dir} to {target_dir}")
         # Use cp command for better handling of large directories
         run(f"cp -r {source_dir}/* {target_dir}/")
 
         # Fix permissions
+        log_message("Fixing permissions...")
         run(f"sudo chown -R $USER:$USER {target_dir}")
 
         # Start Tutor services
+        log_message("Starting Tutor services...")
         run("tutor local start")
 
         log_time("OpenedX media restore", start_time)
+        log_message("OpenedX media restore completed successfully")
         return True
     except Exception as e:
-        print(f"Error restoring OpenedX media: {e}")
+        log_message(f"Error restoring OpenedX media: {e}")
+        import traceback
+        traceback.print_exc()
         # Make sure to restart Tutor services even if there was an error
         try:
+            log_message("Attempting to restart Tutor services after error...")
             run("tutor local start")
         except:
             pass
@@ -597,51 +661,51 @@ def main():
     total_start_time = time.perf_counter()
 
     try:
-        print("Starting restore process...")
-        print(f"Current working directory: {os.getcwd()}")
-        print(f"Arguments: date={args.date}, folder={args.folder}")
+        log_message("Starting restore process...")
+        log_message(f"Current working directory: {os.getcwd()}")
+        log_message(f"Arguments: date={args.date}, folder={args.folder}")
 
         install_requirements()
-        print("Requirements installation completed")
+        log_message("Requirements installation completed")
 
         # Try to find a backup to restore, prioritizing local backup, then S3, then GCS
         backup_path = None
 
         # First try local backup (what was previously stored via rsync)
-        print("Checking for local backup...")
+        log_message("Checking for local backup...")
         backup_path = check_local_backup(args.date, args.folder)
 
         # If local backup not found, try S3
         if not backup_path:
-            print("Local backup not found or not accessible. Trying AWS S3...")
+            log_message("Local backup not found or not accessible. Trying AWS S3...")
             backup_path = download_s3_backup(args.date, args.folder)
 
         # If S3 backup not found, try GCS
         if not backup_path:
-            print("AWS S3 backup not found or not accessible. Trying Google Cloud Storage...")
+            log_message("AWS S3 backup not found or not accessible. Trying Google Cloud Storage...")
             backup_path = download_gcs_backup(args.date, args.folder)
 
         # If still no backup found, exit
         if not backup_path:
-            print("Error: No backup found to restore. Please check backup date or folder name.")
-            print(f"Searched for:")
-            print(f"  - Date: {args.date or 'today'}")
-            print(f"  - Folder: {args.folder or 'auto-generated'}")
-            print(f"  - REMOTE_PATH: {REMOTE_PATH}")
-            print(f"  - AWS_BUCKET_NAME: {AWS_BUCKET_NAME}")
+            log_message("Error: No backup found to restore. Please check backup date or folder name.")
+            log_message(f"Searched for:")
+            log_message(f"  - Date: {args.date or 'today'}")
+            log_message(f"  - Folder: {args.folder or 'auto-generated'}")
+            log_message(f"  - REMOTE_PATH: {REMOTE_PATH}")
+            log_message(f"  - AWS_BUCKET_NAME: {AWS_BUCKET_NAME}")
             sys.exit(1)
 
-        print(f"Found backup at: {backup_path}")
+        log_message(f"Found backup at: {backup_path}")
 
         # Extract directories for backup files
         mysql_tar = os.path.join(backup_path, "mysql_dump.tar.gz")
         mongodb_tar = os.path.join(backup_path, "mongodb_dump.tar.gz")
         openedx_media_tar = os.path.join(backup_path, "openedx_media.tar.gz")
 
-        print(f"Looking for backup files:")
-        print(f"  - MySQL: {mysql_tar} (exists: {os.path.exists(mysql_tar)})")
-        print(f"  - MongoDB: {mongodb_tar} (exists: {os.path.exists(mongodb_tar)})")
-        print(f"  - Media: {openedx_media_tar} (exists: {os.path.exists(openedx_media_tar)})")
+        log_message(f"Looking for backup files:")
+        log_message(f"  - MySQL: {mysql_tar} (exists: {os.path.exists(mysql_tar)})")
+        log_message(f"  - MongoDB: {mongodb_tar} (exists: {os.path.exists(mongodb_tar)})")
+        log_message(f"  - Media: {openedx_media_tar} (exists: {os.path.exists(openedx_media_tar)})")
 
         # Verify checksums if available
         for tar_file in [mysql_tar, mongodb_tar, openedx_media_tar]:
@@ -654,53 +718,56 @@ def main():
         openedx_media_extract_dir = os.path.join(backup_path, "openedx_media_extract")
 
         # Extract all backup files
-        print("Extracting backup files...")
+        log_message("Extracting backup files...")
         extract_tar(mysql_tar, mysql_extract_dir)
         extract_tar(mongodb_tar, mongodb_extract_dir)
         extract_tar(openedx_media_tar, openedx_media_extract_dir)
 
         # Perform restore operations
-        print("\n=== Starting restore process ===\n")
+        log_message("\n=== Starting restore process ===\n")
 
         # Restore MySQL
-        print("\n=== Restoring MySQL database ===\n")
+        log_message("\n=== Restoring MySQL database ===\n")
         if restore_mysql(mysql_extract_dir):
-            print("MySQL restore completed successfully")
+            log_message("MySQL restore completed successfully")
         else:
-            print("MySQL restore failed")
+            log_message("MySQL restore failed")
 
         # Restore MongoDB
-        print("\n=== Restoring MongoDB database ===\n")
+        log_message("\n=== Restoring MongoDB database ===\n")
         if restore_mongodb(mongodb_extract_dir):
-            print("MongoDB restore completed successfully")
+            log_message("MongoDB restore completed successfully")
         else:
-            print("MongoDB restore failed")
+            log_message("MongoDB restore failed")
 
         # Restore OpenedX media
-        print("\n=== Restoring OpenedX media files ===\n")
+        log_message("\n=== Restoring OpenedX media files ===\n")
         if restore_openedx_media(openedx_media_extract_dir):
-            print("OpenedX media restore completed successfully")
+            log_message("OpenedX media restore completed successfully")
         else:
-            print("OpenedX media restore failed")
+            log_message("OpenedX media restore failed")
 
-        # Clean up
-        try:
-            print("\n=== Cleaning up temporary files ===\n")
-            shutil.rmtree(backup_path)
-            print(f"Removed temporary restore directory: {backup_path}")
-        except Exception as e:
-            print(f"Warning: Could not remove restore directory {backup_path}: {e}")
+        # Clean up only if backup was downloaded (not local)
+        if backup_path.startswith(RESTORE_DIR):
             try:
-                run(f"sudo rm -rf {backup_path}")
-                print(f"Removed temporary restore directory with sudo: {backup_path}")
-            except Exception as e2:
-                print(f"Error: Failed to remove restore directory even with sudo: {e2}")
+                log_message("\n=== Cleaning up temporary files ===\n")
+                shutil.rmtree(backup_path)
+                log_message(f"Removed temporary restore directory: {backup_path}")
+            except Exception as e:
+                log_message(f"Warning: Could not remove restore directory {backup_path}: {e}")
+                try:
+                    run(f"sudo rm -rf {backup_path}")
+                    log_message(f"Removed temporary restore directory with sudo: {backup_path}")
+                except Exception as e2:
+                    log_message(f"Error: Failed to remove restore directory even with sudo: {e2}")
+        else:
+            log_message("Local backup used - skipping cleanup of extraction directories")
 
         log_time("Total restore process", total_start_time)
-        print("\n=== Restore process completed ===\n")
+        log_message("\n=== Restore process completed ===\n")
 
     except Exception as e:
-        print(f"FATAL ERROR in restore process: {e}")
+        log_message(f"FATAL ERROR in restore process: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
