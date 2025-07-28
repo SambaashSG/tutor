@@ -9,10 +9,12 @@ import multiprocessing
 import tarfile
 import hashlib
 import concurrent.futures
+import importlib.util
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from functools import partial
 import re
+import requests
 
 # ========= LOAD ENVIRONMENT =========
 
@@ -772,6 +774,158 @@ def transfer_files(files_to_transfer, remote_folder, targets):
     return backup_dir  # Return the backup directory path for cleanup in main
 
 
+# ========= AZURE VM OPERATIONS =========
+
+def start_azure_vm():
+    """Start the Azure VM for restore operations"""
+    log_message("Starting Azure VM for restore operations...")
+    
+    # Get Azure configuration from environment variables
+    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
+    resource_group = os.environ.get("AZURE_RESOURCE_GROUP")
+    vm_name = os.environ.get("AZURE_VM_NAME")
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    client_secret = os.environ.get("AZURE_CLIENT_SECRET")
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    
+    # Check if all required Azure configuration is present
+    if not all([subscription_id, resource_group, vm_name, client_id, client_secret, tenant_id]):
+        log_message("WARNING: Azure configuration is incomplete. Skipping Azure VM operations.")
+        return False
+    
+    # Azure Resource Manager API endpoint for VM start operation
+    url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}/start?api-version=2023-03-01"
+    
+    # Get Azure authentication token
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/token"
+    token_data = {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'resource': 'https://management.azure.com/'
+    }
+    
+    try:
+        # Get authentication token
+        token_response = requests.post(token_url, data=token_data)
+        token_response.raise_for_status()
+        access_token = token_response.json().get('access_token')
+        
+        # Start the VM
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(url, headers=headers)
+        response.raise_for_status()
+        
+        # VM start is asynchronous, so we need to wait for it to complete
+        log_message("Azure VM start initiated. Waiting for VM to be ready...")
+        
+        # Wait for VM to be in running state
+        status_url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}?api-version=2023-03-01"
+        max_retries = 30
+        retry_interval = 10  # seconds
+        
+        for i in range(max_retries):
+            status_response = requests.get(status_url, headers=headers)
+            status_response.raise_for_status()
+            vm_status = status_response.json().get('properties', {}).get('instanceView', {}).get('statuses', [{}])[-1].get('code', '')
+            
+            if 'running' in vm_status.lower():
+                log_message(f"Azure VM is now running after {i * retry_interval} seconds")
+                return True
+            
+            log_message(f"Waiting for Azure VM to start... (Attempt {i+1}/{max_retries})")
+            time.sleep(retry_interval)
+        
+        log_message("WARNING: Timed out waiting for Azure VM to start")
+        return False
+        
+    except Exception as e:
+        log_message(f"ERROR: Failed to start Azure VM: {e}")
+        return False
+
+def stop_azure_vm():
+    """Stop the Azure VM after restore operations"""
+    log_message("Stopping Azure VM after restore operations...")
+    
+    # Get Azure configuration from environment variables
+    subscription_id = os.environ.get("AZURE_SUBSCRIPTION_ID")
+    resource_group = os.environ.get("AZURE_RESOURCE_GROUP")
+    vm_name = os.environ.get("AZURE_VM_NAME")
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    client_secret = os.environ.get("AZURE_CLIENT_SECRET")
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    
+    # Check if all required Azure configuration is present
+    if not all([subscription_id, resource_group, vm_name, client_id, client_secret, tenant_id]):
+        log_message("WARNING: Azure configuration is incomplete. Skipping Azure VM operations.")
+        return False
+    
+    # Azure Resource Manager API endpoint for VM deallocate operation
+    url = f"https://management.azure.com/subscriptions/{subscription_id}/resourceGroups/{resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}/deallocate?api-version=2023-03-01"
+    
+    # Get Azure authentication token
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/token"
+    token_data = {
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'resource': 'https://management.azure.com/'
+    }
+    
+    try:
+        # Get authentication token
+        token_response = requests.post(token_url, data=token_data)
+        token_response.raise_for_status()
+        access_token = token_response.json().get('access_token')
+        
+        # Stop the VM
+        headers = {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.post(url, headers=headers)
+        response.raise_for_status()
+        
+        log_message("Azure VM stop initiated successfully")
+        return True
+        
+    except Exception as e:
+        log_message(f"ERROR: Failed to stop Azure VM: {e}")
+        return False
+
+def trigger_restore():
+    """Trigger the restore process on the Azure VM"""
+    log_message("Triggering restore process on Azure VM...")
+    
+    # Get the path to tutor_restore.py
+    tutor_restore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tutor_restore.py")
+    
+    if not os.path.exists(tutor_restore_path):
+        log_message(f"ERROR: Could not find tutor_restore.py at {tutor_restore_path}")
+        return False
+    
+    try:
+        # Import tutor_restore module dynamically
+        spec = importlib.util.spec_from_file_location("tutor_restore", tutor_restore_path)
+        tutor_restore = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tutor_restore)
+        
+        # Call the main function from tutor_restore
+        log_message("Executing tutor_restore.main()...")
+        tutor_restore.main()
+        
+        log_message("Restore process completed successfully")
+        return True
+        
+    except Exception as e:
+        log_message(f"ERROR: Failed to trigger restore process: {e}")
+        return False
+
 # ========= MAIN =========
 
 
@@ -867,6 +1021,24 @@ def main():
 
     # Transfer compressed files
     transfer_files(files_to_transfer, folder_name, targets)
+
+    # After backup is complete, start Azure VM and trigger restore
+    log_message("Backup completed. Starting Azure VM and triggering restore process...")
+    
+    # Start Azure VM
+    vm_started = start_azure_vm()
+    
+    # If VM started successfully, trigger restore
+    if vm_started:
+        restore_success = trigger_restore()
+        
+        # If restore was successful, stop the VM
+        if restore_success:
+            stop_azure_vm()
+        else:
+            log_message("WARNING: Restore process failed. Azure VM will remain running.")
+    else:
+        log_message("WARNING: Failed to start Azure VM. Skipping restore process.")
 
     # Remove the backup folder after successful transfer
     if os.path.exists(backup_path):
