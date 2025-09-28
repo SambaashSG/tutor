@@ -9,10 +9,6 @@ if [ -f ".env" ]; then
 elif [ -f "/home/$(whoami)/.local/share/tutor/.env" ]; then
     # shellcheck disable=SC1090
     source "/home/$(whoami)/.local/share/tutor/.env"
-elif [ -f "/home/ubuntu/.local/share/tutor/.env" ]; then
-    source "/home/ubuntu/.local/share/tutor/.env"
-elif [ -f "/home/sambaash/.local/share/tutor/.env" ]; then
-    source "/home/sambaash/.local/share/tutor/.env"
 fi
 
 # Determine user from environment, current user, or default to ubuntu
@@ -24,7 +20,7 @@ if [[ "$USER" != "ubuntu" && "$USER" != "sambaash" ]]; then
     exit 1
 fi
 
-# Define paths based on user
+# Define paths
 SCRIPT_DIR="/home/$USER/.local/share/tutor"
 ENV_FILE="$SCRIPT_DIR/.env"
 LOG_FILE="$SCRIPT_DIR/tutor_backup.log"
