@@ -848,7 +848,7 @@ def start_azure_vm():
         
         # Wait for VM to be in running state
         max_retries = 30
-        retry_interval = 10  # seconds
+        retry_interval = 20  # seconds
         
         for i in range(max_retries):
             status_response = requests.get(status_url, headers=headers)
@@ -1134,6 +1134,8 @@ def main():
     # else:
     #     log_message("WARNING: Failed to start Azure VM. Skipping restore process.")
 
+    stop_azure_vm()
+
     # Remove the backup folder after successful transfer
     if os.path.exists(backup_path):
         try:
@@ -1148,6 +1150,8 @@ def main():
                 log_message(f"Error: Failed to remove backup folder even with sudo: {e2}")
 
     log_time("Total backup process", total_start_time)
+
+
 
 
 if __name__ == "__main__":
